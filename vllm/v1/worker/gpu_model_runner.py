@@ -425,6 +425,9 @@ class GPUModelRunner(
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
+        # mm_hash of mm_data => encoder_output on CPU
+        self.encoder_cache_cpu: dict[str, torch.Tensor] = {}
+
         self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
@@ -862,8 +865,10 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
 
+        logger.info(f"free_encoder_mm_hashes: {scheduler_output.free_encoder_mm_hashes}")
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
+            logger.info(f"Freeing encoder cache for {mm_hash}")
             self.encoder_cache.pop(mm_hash, None)
 
         # Remove the unscheduled requests from the persistent batch.
@@ -2327,6 +2332,9 @@ class GPUModelRunner(
         # Cache the encoder outputs by mm_hash
         for mm_hash, output in zip(mm_hashes, encoder_outputs):
             self.encoder_cache[mm_hash] = output
+            if mm_hash not in self.encoder_cache_cpu:
+                logger.info(f"Adding {mm_hash} to encoder_cache_cpu")
+                self.encoder_cache_cpu[mm_hash] = self.encoder_cache[mm_hash].cpu()
             logger.debug("Finish execute for mm hash %s", mm_hash)
             self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
@@ -2392,6 +2400,13 @@ class GPUModelRunner(
 
                 mm_hash = mm_feature.identifier
                 encoder_output = self.encoder_cache.get(mm_hash, None)
+                if encoder_output is None:
+                    logger.info(f"Encoder cache miss for {mm_hash}, loading from CPU.")
+                    cpu_output = self.encoder_cache_cpu.get(mm_hash, None)
+                    # blocking onboarding from CPU to GPU
+                    if cpu_output is not None:
+                        encoder_output = cpu_output.to(self.device)
+                        self.encoder_cache[mm_hash] = encoder_output
                 assert encoder_output is not None, f"Encoder cache miss for {mm_hash}."
 
                 if (is_embed := pos_info.is_embed) is not None:
