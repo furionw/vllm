@@ -93,12 +93,11 @@ class SchedulerConfig:
     NOTE: This is not currently configurable. It will be overridden by
     max_num_batched_tokens in case max multimodal embedding size is larger."""
 
-    # TODO (ywang96): Make this configurable.
-    encoder_cache_size: int = Field(init=False)
+    encoder_cache_size: int | None = None
     """Multimodal encoder cache size, only used in V1.
 
-    NOTE: This is not currently configurable. It will be overridden by
-    max_num_batched_tokens in case max multimodal embedding size is larger."""
+    Set to 0 to disable cross-request caching of encoder outputs.
+    Set to None (default) to auto-configure based on max_num_batched_tokens."""
 
     policy: SchedulerPolicy = "fcfs"
     """The scheduling policy to use:\n
@@ -223,7 +222,12 @@ class SchedulerConfig:
             )
 
         self.max_num_encoder_input_tokens = self.max_num_batched_tokens
-        self.encoder_cache_size = self.max_num_batched_tokens
+
+        # Handle encoder_cache_size configuration
+        if self.encoder_cache_size is None:
+            # Auto: use max_num_batched_tokens (default behavior)
+            self.encoder_cache_size = self.max_num_batched_tokens
+        # else: use the user-provided value (including 0 for no cross-request caching)
 
         if self.enable_chunked_prefill:
             logger.info(

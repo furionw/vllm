@@ -342,9 +342,14 @@ def compute_mm_encoder_budget(
     encoder_compute_budget = max(
         scheduler_config.max_num_encoder_input_tokens, max_tokens_per_mm_item
     )
-    encoder_cache_size = max(
-        scheduler_config.encoder_cache_size, max_tokens_per_mm_item
-    )
+
+    # Special case: encoder_cache_size=0 means disable cross-request caching
+    if scheduler_config.encoder_cache_size is not None:
+        encoder_cache_size = scheduler_config.encoder_cache_size
+    else:
+        encoder_cache_size = max(
+            scheduler_config.encoder_cache_size, max_tokens_per_mm_item
+        )
 
     return encoder_compute_budget, encoder_cache_size
 
