@@ -258,11 +258,17 @@ class LoggingStatLogger(StatLoggerBase):
             log_parts.append("External prefix cache hit rate: %.1f%%")
             log_args.append(self.connector_prefix_caching_metrics.hit_rate * 100)
         if not self.mm_caching_metrics.empty:
-            log_parts.append("MM cache hit rate: %.1f%%")
-            log_args.append(self.mm_caching_metrics.hit_rate * 100)
+            mm = self.mm_caching_metrics
+            log_parts.append("MM cache hits=%d/%d (%.1f%%)")
+            log_args.extend([mm.aggregated_query_hit,
+                             mm.aggregated_query_total,
+                             mm.hit_rate * 100])
         if not self.encoder_caching_metrics.empty:
-            log_parts.append("Encoder cache hit rate: %.1f%%")
-            log_args.append(self.encoder_caching_metrics.hit_rate * 100)
+            ec = self.encoder_caching_metrics
+            log_parts.append("Encoder cache hits=%d/%d (%.1f%%)")
+            log_args.extend([ec.aggregated_query_hit,
+                             ec.aggregated_query_total,
+                             ec.hit_rate * 100])
 
         log_fn(
             self.log_prefix + ", ".join(log_parts),
