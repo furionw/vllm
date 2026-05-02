@@ -116,6 +116,89 @@ class EncoderCacheManager:
         self.cached[mm_hash].add(request.request_id)
         return True
 
+    def check_only(self, request: Request, input_id: int) -> bool:
+        """Non-mutating cache probe.
+
+        Returns True iff the input's mm_hash is currently in ``cached`` (the
+        ref set may be empty — i.e. the entry is in ``freeable``). Used by
+        the scheduler's two-phase encoder-input classification: phase 1
+        classifies without mutating state in case the request needs to be
+        parked for an async load on another mm_feature.
+
+        Phase 2 commit calls ``check_and_update_cache`` for the same
+        ``(request, input_id)`` pair to perform the ref-count and freeable
+        updates.
+        """
+        mm_hash = request.mm_features[input_id].identifier
+        return mm_hash in self.cached
+
+    def register_external_loaded(
+        self,
+        mm_hash: str,
+        num_encoder_embeds: int,
+        refs: set[str],
+    ) -> None:
+        """Promote an mm_hash that just became GPU-resident via an async
+        external load.
+
+        The scheduler calls this from ``_update_from_ec_xfer_finished`` when
+        a previously-LOADING hash reports completion via
+        ``ECConnectorOutput.finished_loading``. The hash is registered with
+        the supplied set of waiter request_ids as live references so the
+        entry is NOT in ``freeable`` and cannot be LRU-evicted before the
+        waiters re-admit and pass through Phase 2 commit.
+
+        Slots were pre-reserved by ``reserve_async_loaded_slots`` when the
+        scheduler parked the request — so we DO NOT decrement free/freeable
+        slots again here, just promote the entry into ``cached`` with live
+        refs so the LRU cannot evict it before waiters re-admit.
+        """
+        assert mm_hash not in self.cached, (
+            f"register_external_loaded: {mm_hash} already in cache"
+        )
+        assert refs, (
+            "register_external_loaded: refs must be non-empty; "
+            "an unreferenced load should have been ABANDONED at the scheduler"
+        )
+        self.cached[mm_hash] = set(refs)
+        # Intentionally NOT inserted into ``self.freeable`` — having live
+        # refs makes the entry non-evictable. It becomes freeable only when
+        # the last ref drops via ``free(request)``, which is the normal path.
+
+    def reserve_async_loaded_slots(self, num_encoder_embeds: int) -> bool:
+        """Reserve cache slots for an in-flight async external load.
+
+        Mirrors ``can_allocate`` but operates without a request/input_id
+        because the scheduler-side EC park flow doesn't have a placement
+        slot to bind to yet. Returns True iff slots were reserved (eviction
+        from ``freeable`` may have happened to make room). Returns False if
+        free + freeable combined isn't enough.
+        """
+        if num_encoder_embeds <= self.num_free_slots:
+            self.num_free_slots -= num_encoder_embeds
+            self.num_freeable_slots -= num_encoder_embeds
+            return True
+        if num_encoder_embeds > self.num_freeable_slots:
+            return False
+        # Evict freeable to make room (mirrors can_allocate eviction path).
+        while num_encoder_embeds > self.num_free_slots:
+            mm_hash, num_free_embeds = self.freeable.popitem(last=False)
+            del self.cached[mm_hash]
+            self.freed.append(mm_hash)
+            self.num_free_slots += num_free_embeds
+        self.num_free_slots -= num_encoder_embeds
+        self.num_freeable_slots -= num_encoder_embeds
+        return True
+
+    def release_async_loaded_slots(self, num_encoder_embeds: int) -> None:
+        """Return slots reserved by ``reserve_async_loaded_slots`` when the
+        async load is abandoned (last waiter aborted) AFTER the worker
+        reports completion. Used by ``Scheduler._update_from_ec_xfer_finished``
+        on the ABANDONED branch.
+        """
+        self.num_free_slots += num_encoder_embeds
+        self.num_freeable_slots += num_encoder_embeds
+
     def can_allocate(
         self,
         request: Request,

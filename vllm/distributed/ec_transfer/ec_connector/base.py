@@ -51,9 +51,19 @@ class ECConnectorMetadata(ABC):  # noqa: B024
     """
     Abstract Metadata used to communicate between the
     Scheduler ECConnector and Worker ECConnector.
+
+    The base class declares an ``evict_orphan`` slot that the scheduler
+    populates with mm_hashes whose async-load was abandoned after the H2D
+    completed: the worker connector should drop these from any private
+    "completed but unclaimed" tensor map. Concrete subclasses inherit this
+    field via ``__post_init__`` (for dataclasses) or by calling
+    ``super().__init__()``.
     """
 
-    pass
+    evict_orphan: set[str]
+
+    def __init__(self) -> None:
+        self.evict_orphan = set()
 
 
 class ECConnectorBase(ABC):
@@ -182,6 +192,30 @@ class ECConnectorBase(ABC):
         """
         return None, None
 
+    def get_finished_loads(
+        self,
+        encoder_cache: dict[str, torch.Tensor] | None = None,
+    ) -> set[str] | None:
+        """Per-mm_hash async-load completion signal.
+
+        Returns the set of mm_hashes whose async H2D copy event has fired
+        since the last call. The connector MUST move each completed tensor
+        into ``encoder_cache[mm_hash]`` before adding the hash to the
+        returned set, so that the next consumer step's
+        ``_gather_mm_embeddings`` sees the GPU-resident tensor.
+
+        The default implementation returns ``None`` — connectors that don't
+        support async loads (only the legacy sync block-fetch) keep returning
+        ``None`` and never park requests via ``has_cache_item`` returning
+        ``(True, True)``.
+
+        Args:
+            encoder_cache: the worker-side per-mm_hash GPU tensor map. The
+                connector inserts completed tensors into this dict before
+                reporting completion. Passed by ``ECConnectorModelRunnerMixin``.
+        """
+        return None
+
     # ==============================
     # Scheduler-side methods
     # ==============================
@@ -190,28 +224,70 @@ class ECConnectorBase(ABC):
     def has_cache_item(
         self,
         identifier: str,
-    ) -> bool:
-        """
-        Check if a single encoder cache exists
+    ) -> "bool | tuple[bool, bool]":
+        """Check if a single encoder cache exists.
 
         Args:
-            identifier (str): the identifier of the media.
+            identifier: the identifier of the media (mm_hash).
 
         Returns:
-            A bool where value is True if cache exist for
-            the media
+            Either a plain ``bool`` (legacy: True means CPU/external hit, the
+            scheduler routes this to the synchronous external_load path) or a
+            tuple ``(hit, load_async)``:
+
+            - ``(False, _)``   — miss; encoder runs.
+            - ``(True, False)``— sync hit; today's behavior (worker
+              ``start_load_caches`` performs an inline H2D in the same step
+              the request is admitted).
+            - ``(True, True)`` — async hit; the scheduler parks the request
+              in ``RequestStatus.WAITING_FOR_EMBEDDINGS`` and dispatches the
+              worker H2D on a side stream. The connector MUST report
+              completion via ``get_finished_loads`` once the H2D's CUDA event
+              has fired.
+
+            Connectors that do not support async loads should keep returning
+            plain ``bool`` (or ``(hit, False)``) — back-compat is guaranteed.
         """
         pass
 
     @abstractmethod
     def update_state_after_alloc(self, request: "Request", index: int):
-        """
-        Update ECConnector state to decide allocate cache for requests
+        """Sync external-load hook.
+
+        Called by the scheduler after a sync external-load hit
+        (``has_cache_item`` returned ``True`` or ``(True, False)``) and
+        ``encoder_cache_manager.allocate(request, i)`` has been called.
+
+        Contract:
+        - The connector MUST deduplicate by mm_hash. The scheduler may call
+          this hook multiple times within a single step for the same
+          ``(request, mm_hash)`` pair (once per sibling request sharing the
+          hash), and the resulting connector metadata's ``loads`` collection
+          MUST yield each mm_hash at most once. This is the system-level
+          "exactly one H2D per hash" guarantee.
 
         Args:
-            request (Request): the request object.
+            request: the request object.
+            index: the mm_features index.
         """
         pass
+
+    def request_async_load(self, request: "Request", index: int) -> None:
+        """Async external-load hook.
+
+        Called by the scheduler after a ``(True, True)`` hit, when the
+        request is being parked in ``WAITING_FOR_EMBEDDINGS``. Unlike
+        ``update_state_after_alloc``, ``encoder_cache_manager.allocate``
+        has NOT been called for the hash — the slot reservation is tracked
+        separately by the scheduler's inflight-async budget until the load
+        completes and is promoted via ``register_external_loaded``.
+
+        Default impl delegates to ``update_state_after_alloc`` so connectors
+        with a unified load-recording path (e.g. dump everything into
+        ``_loads_this_step``) work without override. Connectors that need
+        to distinguish sync-allocated vs async-pending should override.
+        """
+        self.update_state_after_alloc(request, index)
 
     @abstractmethod
     def build_connector_meta(

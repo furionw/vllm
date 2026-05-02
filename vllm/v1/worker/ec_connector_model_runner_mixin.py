@@ -71,6 +71,13 @@ class ECConnectorModelRunnerMixin:
         try:
             yield output
         finally:
+            # Per-mm_hash async-load completion signal. The connector moves
+            # each completed tensor into encoder_cache[mm_hash] before adding
+            # the hash to the returned set, so the next consumer step's
+            # _gather_mm_embeddings sees the GPU-resident tensor.
+            output.finished_loading = ec_connector.get_finished_loads(
+                encoder_cache=encoder_cache
+            )
             output.finished_sending, output.finished_recving = (
                 ec_connector.get_finished(scheduler_output.finished_req_ids)
             )
