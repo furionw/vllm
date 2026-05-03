@@ -36,6 +36,7 @@ class ECExampleConnectorMetadata(ECConnectorMetadata):
     mm_datas: list[MMMeta]
 
     def __init__(self):
+        super().__init__()
         self.mm_datas = []
 
     def add_mm_data(self, mm_data: MMMeta):

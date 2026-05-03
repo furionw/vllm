@@ -4,7 +4,7 @@ import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -55,13 +55,54 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    DraftTokenIds,
+    ECConnectorOutput,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+)
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _normalize_has_cache_item(
+    result: "bool | tuple[bool, bool]",
+) -> tuple[bool, bool]:
+    """Adapt the back-compat ``has_cache_item`` return to ``(hit, load_async)``.
+
+    Connectors that pre-date the async-load path return a plain ``bool``;
+    we map those to ``(hit, False)`` so the existing sync external_load
+    path runs unchanged.
+    """
+    if isinstance(result, tuple):
+        hit, load_async = result
+        return bool(hit), bool(load_async)
+    return bool(result), False
+
+
+@dataclass
+class _EmbeddingLoadState:
+    """Per-mm_hash async-load state owned by the scheduler.
+
+    Lifecycle:
+      LOADING -> (event fires + finished_loading reported) -> entry dropped
+                 (hash promoted into encoder_cache_manager.cached).
+      LOADING -> last waiter aborted -> ABANDONED
+                 (num_inflight_async_embeds NOT decremented yet — the GPU
+                  allocation is still real until the worker reports
+                  completion; decrement happens then).
+      ABANDONED -> new waiter arrives -> back to LOADING (resurrection).
+      ABANDONED -> event fires + finished_loading reported -> entry dropped,
+                   evict_orphan queued for the worker.
+    """
+
+    state: str  # "LOADING" | "ABANDONED"
+    num_embeds: int
+    waiters: set[str] = field(default_factory=set)
 
 
 class Scheduler(SchedulerInterface):
@@ -182,6 +223,29 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+
+        # EC Connector: per-mm_hash async-load state machine.
+        # ``embedding_loads`` maps mm_hash to (state, num_embeds, waiters).
+        # State is "LOADING" while the worker H2D is in flight, "ABANDONED"
+        # if the last waiter aborted before the H2D event fired (the GPU
+        # allocation is still real until completion is reported).
+        # ``waiting_for_embeddings`` is the per-request derived view of which
+        # mm_hashes the request still depends on before it can be re-admitted
+        # from RequestStatus.WAITING_FOR_EMBEDDINGS.
+        self.embedding_loads: dict[str, _EmbeddingLoadState] = {}
+        self.waiting_for_embeddings: dict[str, set[str]] = {}
+        # Inflight slot reservation: the encoder-cache budget effectively
+        # available is ``cache_size - num_inflight_async_embeds``. Decremented
+        # only when a load completes (LOADING→promote OR ABANDONED→drop) —
+        # never on abort, because the GPU allocation is still alive.
+        self.num_inflight_async_embeds: int = 0
+        # mm_hashes whose async-load was abandoned and whose tensor must be
+        # dropped from the worker's private map next step. Flushed into
+        # ECConnectorMetadata.evict_orphan by build_connector_meta.
+        self._pending_orphan_evicts: set[str] = set()
+        # Running requests parked mid-iteration; flushed to self.waiting at
+        # end of schedule() to avoid mutating self.running mid-iteration.
+        self._defer_running_park: list[Request] = []
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -423,6 +487,7 @@ class Scheduler(SchedulerInterface):
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
             external_load_encoder_input: list[int] = []
+            async_load_encoder_input: list[int] = []
             new_encoder_compute_budget = encoder_compute_budget
             if request.has_encoder_inputs:
                 (
@@ -430,6 +495,7 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens,
                     new_encoder_compute_budget,
                     external_load_encoder_input,
+                    async_load_encoder_input,
                 ) = self._try_schedule_encoder_inputs(
                     request,
                     request.num_computed_tokens,
@@ -437,6 +503,16 @@ class Scheduler(SchedulerInterface):
                     encoder_compute_budget,
                     shift_computed_tokens=1 if self.use_eagle else 0,
                 )
+
+            if async_load_encoder_input:
+                # ECTransfer (running path): chunked-prefill mid-flight hit
+                # an async EC for a later mm_feature. Park the request in
+                # WAITING_FOR_EMBEDDINGS without releasing KV blocks. Defer
+                # removal from self.running until end of iteration.
+                self._park_for_embeddings(request, async_load_encoder_input)
+                self._defer_running_park.append(request)
+                req_index += 1
+                continue
 
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
@@ -554,6 +630,11 @@ class Scheduler(SchedulerInterface):
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
 
+        # ECTransfer: flush any RUNNING requests that were parked into
+        # WAITING_FOR_EMBEDDINGS during this iteration. Done after the
+        # running-loop exits so we never mutate self.running mid-iteration.
+        self._flush_running_park_for_embeddings()
+
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
         if self.lora_config:
@@ -590,6 +671,25 @@ class Scheduler(SchedulerInterface):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
+
+                # ECTransfer: skip request if still waiting for async embedding loads.
+                if request.status == RequestStatus.WAITING_FOR_EMBEDDINGS:
+                    if not self.waiting_for_embeddings.get(request_id):
+                        # All async loads have promoted into encoder_cache_manager.
+                        # Re-admit. Preserve PREEMPTED on resumed preemption path.
+                        if request.num_preemptions:
+                            request.status = RequestStatus.PREEMPTED
+                        else:
+                            request.status = RequestStatus.WAITING
+                    else:
+                        logger.debug(
+                            "%s still WAITING_FOR_EMBEDDINGS (%d hashes pending).",
+                            request_id,
+                            len(self.waiting_for_embeddings[request_id]),
+                        )
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
 
                 # Check that adding the request still respects the max_loras
                 # constraint.
@@ -663,6 +763,7 @@ class Scheduler(SchedulerInterface):
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
+                async_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
 
                 if load_kv_async:
@@ -699,6 +800,7 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             new_encoder_compute_budget,
                             external_load_encoder_input,
+                            async_load_encoder_input,
                         ) = self._try_schedule_encoder_inputs(
                             request,
                             num_computed_tokens,
@@ -706,6 +808,15 @@ class Scheduler(SchedulerInterface):
                             encoder_compute_budget,
                             shift_computed_tokens=1 if self.use_eagle else 0,
                         )
+                        if async_load_encoder_input:
+                            # ECTransfer: park request in WAITING_FOR_EMBEDDINGS
+                            # to wait on async H2D loads. Skip allocation; the
+                            # request will re-enter the scheduling loop after
+                            # the worker reports finished_loading.
+                            request = request_queue.pop_request()
+                            self._park_for_embeddings(request, async_load_encoder_input)
+                            step_skipped_waiting.prepend_request(request)
+                            continue
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
                             break
@@ -951,6 +1062,13 @@ class Scheduler(SchedulerInterface):
             ec_meta: ECConnectorMetadata = self.ec_connector.build_connector_meta(
                 scheduler_output
             )
+            # Append scheduler-tracked orphan evicts for the worker to drop
+            # tensors whose async-load was abandoned but completed anyway.
+            if self._pending_orphan_evicts:
+                ec_meta.evict_orphan = (
+                    set(ec_meta.evict_orphan) | self._pending_orphan_evicts
+                )
+                self._pending_orphan_evicts.clear()
             scheduler_output.ec_connector_metadata = ec_meta
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
@@ -1120,7 +1238,7 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         encoder_compute_budget: int,
         shift_computed_tokens: int = 0,
-    ) -> tuple[list[int], int, int, list[int]]:
+    ) -> tuple[list[int], int, int, list[int], list[int]]:
         """
         Determine which encoder inputs need to be scheduled in the current step,
         and update `num_new_tokens` and encoder token budget accordingly.
@@ -1140,14 +1258,45 @@ class Scheduler(SchedulerInterface):
 
         Note that num_computed_tokens includes both locally cached
         blocks and externally cached blocks (via KVConnector).
+
+        Returns a 5-tuple: ``(encoder_inputs_to_schedule, num_new_tokens,
+        encoder_compute_budget, external_load_encoder_input,
+        async_load_encoder_input)``. The fifth element is non-empty iff the
+        request must be parked in ``WAITING_FOR_EMBEDDINGS`` for this step
+        to wait on async EC loads — when populated, the other lists are
+        empty and the request must NOT be admitted to ``running`` this
+        step. The caller routes to the park branch.
         """
         if num_new_tokens == 0 or not request.has_encoder_inputs:
-            return [], num_new_tokens, encoder_compute_budget, []
+            return [], num_new_tokens, encoder_compute_budget, [], []
         encoder_inputs_to_schedule: list[int] = []
         mm_features = request.mm_features
         assert mm_features is not None
         assert len(mm_features) > 0
         external_load_encoder_input = []
+
+        # Async-EC prepass: non-mutating scan of mm_features that overlap
+        # with this step's [num_computed_tokens, num_computed_tokens +
+        # num_new_tokens) window. If any feature would route to the async
+        # external-load path (new async hit, or piggyback on a hash already
+        # LOADING/ABANDONED in self.embedding_loads), short-circuit and
+        # report the async indices so the caller parks the request. We do
+        # NOT mutate encoder_cache_manager state in this prepass.
+        async_load_encoder_input = self._prepare_async_load_indices(
+            request,
+            mm_features,
+            num_computed_tokens,
+            num_new_tokens,
+            shift_computed_tokens,
+        )
+        if async_load_encoder_input:
+            return (
+                [],
+                num_new_tokens,
+                encoder_compute_budget,
+                [],
+                async_load_encoder_input,
+            )
 
         # NOTE: since scheduler operates on the request level (possibly with
         # multiple encoder inputs per request), we need to create temporary
@@ -1256,13 +1405,18 @@ class Scheduler(SchedulerInterface):
             if curr_embeds_end - curr_embeds_start == 0:
                 continue
 
-            if self.ec_connector is not None and self.ec_connector.has_cache_item(
-                item_identifier
-            ):
-                mm_hashes_to_schedule.add(item_identifier)
-                external_load_encoder_input.append(i)
-                num_embeds_to_schedule += num_encoder_embeds
-                continue
+            if self.ec_connector is not None:
+                hit_result = self.ec_connector.has_cache_item(item_identifier)
+                hit, _load_async = _normalize_has_cache_item(hit_result)
+                if hit:
+                    # Sync external-load only here. Async hits are handled by
+                    # the per-request prepass at the top of this method, which
+                    # short-circuits with async_load_encoder_input populated
+                    # before this loop runs.
+                    mm_hashes_to_schedule.add(item_identifier)
+                    external_load_encoder_input.append(i)
+                    num_embeds_to_schedule += num_encoder_embeds
+                    continue
 
             num_embeds_to_schedule += num_encoder_embeds
             encoder_compute_budget -= num_encoder_embeds
@@ -1274,7 +1428,76 @@ class Scheduler(SchedulerInterface):
             num_new_tokens,
             encoder_compute_budget,
             external_load_encoder_input,
+            [],  # async_load_encoder_input — empty in the no-async path
         )
+
+    def _prepare_async_load_indices(
+        self,
+        request: Request,
+        mm_features,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        shift_computed_tokens: int,
+    ) -> list[int]:
+        """Non-mutating prepass: detect async EC hits among mm_features that
+        overlap this step's computed-tokens window.
+
+        Returns the list of mm_feature indices that need an async load —
+        either piggyback (hash already in ``self.embedding_loads`` with
+        state LOADING/ABANDONED) or new (connector reports
+        ``has_cache_item`` returning ``(True, True)``).
+
+        Returns empty list if no async path applies, OR if the EC connector
+        is not configured at all. The mutating sync external-load path then
+        runs normally in the caller.
+        """
+        async_indices: list[int] = []
+        if self.is_encoder_decoder:
+            # Encoder-decoder models do not use the encoder cache like
+            # decoder-only multimodal does.
+            return async_indices
+        if self.ec_connector is None and not self.embedding_loads:
+            return async_indices
+
+        seen_hashes: set[str] = set()
+        for i, mm_feature in enumerate(mm_features):
+            start_pos = mm_feature.mm_position.offset
+            num_encoder_tokens = mm_feature.mm_position.length
+
+            if (
+                start_pos
+                >= num_computed_tokens + num_new_tokens + shift_computed_tokens
+            ):
+                break
+            if start_pos + num_encoder_tokens <= num_computed_tokens:
+                continue
+
+            h = mm_feature.identifier
+            if h in seen_hashes:
+                continue
+
+            # Piggyback on a hash whose load is already dispatched.
+            if h in self.embedding_loads:
+                seen_hashes.add(h)
+                async_indices.append(i)
+                continue
+
+            # GPU-resident hit (already in encoder_cache_manager.cached) —
+            # not async; let the existing mutating path admit it normally.
+            if self.encoder_cache_manager.check_only(request, i):
+                seen_hashes.add(h)
+                continue
+
+            if self.ec_connector is None:
+                continue
+
+            hit_result = self.ec_connector.has_cache_item(h)
+            hit, load_async = _normalize_has_cache_item(hit_result)
+            if hit and load_async:
+                seen_hashes.add(h)
+                async_indices.append(i)
+
+        return async_indices
 
     def get_grammar_bitmask(
         self, scheduler_output: SchedulerOutput
@@ -1510,6 +1733,11 @@ class Scheduler(SchedulerInterface):
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
+
+        # EC Connector: update state for finished async embedding loads.
+        ec_connector_output = model_runner_output.ec_connector_output
+        if ec_connector_output is not None:
+            self._update_from_ec_xfer_finished(ec_connector_output)
 
         # collect KV cache events from KV cache manager
         events = self.kv_cache_manager.take_events()
@@ -1829,6 +2057,10 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+        # EC Connector: drop the request from any pending async-load waiter
+        # sets. Last-waiter-out flips state to ABANDONED; the GPU allocation
+        # is still alive until the worker reports finished_loading.
+        self._cleanup_embedding_load_waiter(request.request_id)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
@@ -1935,6 +2167,163 @@ class Scheduler(SchedulerInterface):
         stale vision embeddings are not reused.
         """
         self.encoder_cache_manager.reset()
+
+    # ==============================
+    # EC Connector — async-load lifecycle
+    # ==============================
+
+    def _park_for_embeddings(
+        self,
+        request: Request,
+        async_load_encoder_input: list[int],
+    ) -> None:
+        """Transition a request to ``WAITING_FOR_EMBEDDINGS``.
+
+        For each async-load mm_feature index, either dispatch a fresh load
+        (creating ``embedding_loads[h] = LOADING``) or piggyback on an
+        existing in-flight entry. ``encoder_cache_manager.allocate`` is NOT
+        called for any of these hashes — the slot reservation is tracked
+        separately via ``num_inflight_async_embeds``. Slots are committed
+        into the cache manager only on completion via
+        ``register_external_loaded`` from ``_update_from_ec_xfer_finished``.
+        """
+        assert self.ec_connector is not None
+        req_id = request.request_id
+        pending: set[str] = self.waiting_for_embeddings.setdefault(req_id, set())
+
+        for i in async_load_encoder_input:
+            h = request.mm_features[i].identifier
+            num_embeds = request.get_num_encoder_embeds(i)
+            existing = self.embedding_loads.get(h)
+
+            if existing is not None:
+                # Resurrect ABANDONED hashes; otherwise just append waiter.
+                if existing.state == "ABANDONED":
+                    existing.state = "LOADING"
+                existing.waiters.add(req_id)
+                pending.add(h)
+                continue
+
+            # Fresh async load. Same-hash orphan-rescue check: if a prior
+            # ABANDONED load just completed and is queued for evict, cancel
+            # the evict and re-use the orphan tensor on the worker side.
+            self._pending_orphan_evicts.discard(h)
+
+            # Reserve encoder-cache slots up-front so concurrent encoder
+            # compute on other requests can't eat the budget during the
+            # park window (otherwise register_external_loaded would fail
+            # its capacity assertion when this load completes).
+            if not self.encoder_cache_manager.reserve_async_loaded_slots(
+                num_embeds
+            ):
+                # Insufficient capacity — fall back to sync encoder compute
+                # by skipping the async path for this hash. Caller will
+                # treat the missing entry as a normal miss.
+                logger.warning(
+                    "Async EC: insufficient encoder cache for %s (%d embeds); "
+                    "falling back to sync compute path",
+                    h,
+                    num_embeds,
+                )
+                continue
+
+            self.embedding_loads[h] = _EmbeddingLoadState(
+                state="LOADING",
+                num_embeds=num_embeds,
+                waiters={req_id},
+            )
+            self.num_inflight_async_embeds += num_embeds
+            pending.add(h)
+            self.ec_connector.request_async_load(request, i)
+
+        request.status = RequestStatus.WAITING_FOR_EMBEDDINGS
+
+    def _flush_running_park_for_embeddings(self) -> None:
+        """Move any running requests parked during this iteration into
+        ``self.waiting``. Called once at end of the schedule() main loop —
+        we do not modify ``self.running`` mid-iteration.
+        """
+        if not self._defer_running_park:
+            return
+        for r in self._defer_running_park:
+            try:
+                self.running.remove(r)
+            except ValueError:
+                # Already removed by another path (preempt, finish).
+                pass
+            else:
+                self.waiting.add_request(r)
+        self._defer_running_park.clear()
+
+    def _update_from_ec_xfer_finished(self, ec_output: ECConnectorOutput) -> None:
+        """EC Connector: consume ``finished_loading`` from the worker.
+
+        For each completed mm_hash:
+          - If state == LOADING → promote into encoder_cache_manager with
+            non-empty refs (prevents LRU eviction before waiters re-admit).
+          - If state == ABANDONED → drop, queue evict_orphan for the worker.
+          - If unknown (e.g. raced with abort) → queue evict_orphan.
+        """
+        if not ec_output.finished_loading:
+            return
+        for h in ec_output.finished_loading:
+            load = self.embedding_loads.get(h)
+            if load is None:
+                # Worker reported completion for a hash the scheduler no
+                # longer tracks. Queue eviction; do not touch the manager.
+                self._pending_orphan_evicts.add(h)
+                continue
+            if load.state == "ABANDONED":
+                self.embedding_loads.pop(h, None)
+                self.num_inflight_async_embeds -= load.num_embeds
+                # Return reserved slots — they were never promoted into
+                # cached, so register_external_loaded won't run for this hash.
+                self.encoder_cache_manager.release_async_loaded_slots(
+                    load.num_embeds
+                )
+                self._pending_orphan_evicts.add(h)
+                continue
+            # state == "LOADING" → promote.
+            assert load.state == "LOADING", (
+                f"unexpected embedding_loads state for {h}: {load.state}"
+            )
+            assert load.waiters, (
+                f"LOADING entry for {h} has no waiters — should be ABANDONED"
+            )
+            self.encoder_cache_manager.register_external_loaded(
+                h, load.num_embeds, refs=load.waiters
+            )
+            self.num_inflight_async_embeds -= load.num_embeds
+            for waiter_id in load.waiters:
+                pending = self.waiting_for_embeddings.get(waiter_id)
+                if pending is None:
+                    continue
+                pending.discard(h)
+                if not pending:
+                    self.waiting_for_embeddings.pop(waiter_id, None)
+            self.embedding_loads.pop(h, None)
+
+    def _cleanup_embedding_load_waiter(self, req_id: str) -> None:
+        """Drop a request's tracking from ``embedding_loads`` on free/abort.
+
+        Iterates each pending mm_hash for the request; removes the request
+        from the hash's waiter set. If the waiter set empties AND state is
+        LOADING, transition to ABANDONED. We do NOT decrement
+        ``num_inflight_async_embeds`` here — the GPU allocation is still
+        in flight; the decrement happens when the worker reports
+        ``finished_loading`` and ``_update_from_ec_xfer_finished`` drops the
+        ABANDONED entry.
+        """
+        pending = self.waiting_for_embeddings.pop(req_id, None)
+        if not pending:
+            return
+        for h in pending:
+            load = self.embedding_loads.get(h)
+            if load is None:
+                continue
+            load.waiters.discard(req_id)
+            if not load.waiters and load.state == "LOADING":
+                load.state = "ABANDONED"
 
     def make_stats(
         self,

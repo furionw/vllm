@@ -158,6 +158,11 @@ class ECConnectorOutput:
     # [mm_hash]
     finished_sending: set[str] | None = None
     finished_recving: set[str] | None = None
+    # [mm_hash] — async-load completions reported by the worker connector
+    # for hashes whose H2D event has fired since the last poll. Consumed by
+    # Scheduler._update_from_ec_xfer_finished to promote hashes into
+    # encoder_cache_manager and re-admit WAITING_FOR_EMBEDDINGS requests.
+    finished_loading: set[str] | None = None
 
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.

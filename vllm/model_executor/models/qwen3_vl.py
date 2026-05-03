@@ -1707,11 +1707,27 @@ class Qwen3VLForConditionalGeneration(
             return None  # If vision tower is skipped
         if getattr(self, "deepstack_input_embeds_num_tokens", 0) == 0:
             return None
-        if num_tokens > self.deepstack_input_embeds_num_tokens:
-            raise ValueError(
-                "Requested more deepstack tokens than available in buffer: "
-                f"{num_tokens=} > {self.deepstack_input_embeds_num_tokens=}"
-            )
+        # When num_tokens (the cudagraph-padded LM batch size) exceeds the
+        # actual mm-token span stored, zero the tail so the padded positions
+        # contribute no deepstack signal. Required because the EC-connector
+        # async-load path parks reqs and produces schedules whose
+        # total_num_scheduled_tokens lands inside the next cudagraph capture
+        # bucket (e.g. 34 -> padded 40), so inputs_embeds.size(0) > stored.
+        stored = self.deepstack_input_embeds_num_tokens
+        if num_tokens > stored:
+            for idx in range(self.deepstack_num_level):
+                buf = self.deepstack_input_embeds[idx]
+                if num_tokens > buf.size(0):
+                    grown = torch.zeros(
+                        num_tokens,
+                        buf.size(1),
+                        device=buf.device,
+                        dtype=buf.dtype,
+                    )
+                    grown[:stored].copy_(buf[:stored])
+                    self.deepstack_input_embeds[idx] = grown
+                else:
+                    buf[stored:num_tokens].zero_()
 
         # get deepstack_input_embeds from buffer, and clear the buffer
         return IntermediateTensors(
@@ -1753,14 +1769,12 @@ class Qwen3VLForConditionalGeneration(
 
         # clear deepstack_input_embeds in buffer
         if num_tokens > 0:
-            if num_tokens > self.deepstack_input_embeds_num_tokens:
-                raise ValueError(
-                    "Requested to clear more deepstack tokens than available in "
-                    "buffer: "
-                    f"{num_tokens=} > {self.deepstack_input_embeds_num_tokens=}"
-                )
+            # Clamp to stored count: cudagraph padding may exceed the actual
+            # mm payload, but only the valid range needs zeroing — the tail
+            # was already zeroed in _get_deepstack_input_embeds.
+            n = min(num_tokens, self.deepstack_input_embeds_num_tokens)
             for idx in range(self.deepstack_num_level):
-                self.deepstack_input_embeds[idx][:num_tokens].zero_()
+                self.deepstack_input_embeds[idx][:n].zero_()
             self.deepstack_input_embeds_num_tokens = 0
 
     # -- SupportsEncoderCudaGraph protocol methods --
