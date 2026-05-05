@@ -3273,7 +3273,8 @@ class GPUModelRunner(
                 scheduler_output,
                 encoder_cache=self.encoder_cache,
             ) as ec_connector_output:
-                self._execute_mm_encoder(scheduler_output)
+                with record_function_or_nullcontext("gpu_model_runner: vit_forward"):
+                    self._execute_mm_encoder(scheduler_output)
                 mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
@@ -3352,7 +3353,8 @@ class GPUModelRunner(
             # simpler, because the outputs are just passed to the decoder.
             # We are not doing any prompt replacement. We also will only
             # ever have a single encoder input.
-            encoder_outputs = self._execute_mm_encoder(scheduler_output)
+            with record_function_or_nullcontext("gpu_model_runner: vit_forward"):
+                encoder_outputs = self._execute_mm_encoder(scheduler_output)
             model_kwargs.update({"encoder_outputs": encoder_outputs})
 
         return (
