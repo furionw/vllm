@@ -600,6 +600,11 @@ class GPUModelRunner(
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
 
+        # Per-step token telemetry counter — incremented each execute_model
+        # call. Used by the step_tokens log line and step_meta NVTX range to
+        # correlate forward duration with prefill/decode batch shape.
+        self._step_log_counter = 0
+
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
         # `initialize_kv_cache` based on the kv cache config. However, as in
@@ -2865,84 +2870,92 @@ class GPUModelRunner(
         encoder_outputs: list[torch.Tensor] = []
         # Track the current index in mm_kwargs/mm_lora_refs to map groups to request IDs
         current_item_idx = 0
-        for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
-            mm_kwargs,
-            device=self.device,
-            pin_memory=self.pin_memory,
-        ):
-            batch_outputs: MultiModalEmbeddings
-
-            # EVS and dynamic res video related change.
-            # (ekhvedchenia): Temporary hack to limit peak memory usage when
-            # processing multimodal data. This solves the issue with scheduler
-            # putting too many video samples into a single batch. Scheduler
-            # uses pruned vision tokens count to compare it versus compute
-            # budget which is incorrect (Either input media size or non-pruned
-            # output vision tokens count should be considered)
-            # dynamic res video for nemotron temporarily uses this hack via
-            # requires_sequential_video_encoding
-            # because it doesn't yet support video batching.
-            # TODO(ywang96): Fix memory profiling to take EVS into account and
-            # remove this hack.
-            if (
-                (
-                    self.is_multimodal_pruning_enabled
-                    or self.requires_sequential_video_encoding
-                )
-                and modality == "video"
-                and num_items > 1
+        # The vit_forward marker wraps ONLY the encoder GPU work. The
+        # post-encoder save loop below (maybe_save_ec_to_connector) is a
+        # sibling, not nested, so save_d2h does not contaminate vit_forward.
+        with record_function_or_nullcontext("gpu_model_runner: vit_forward"):
+            for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
+                mm_kwargs,
+                device=self.device,
+                pin_memory=self.pin_memory,
             ):
-                batch_outputs_lst = list[torch.Tensor]()
-                for video_idx in range(num_items):
-                    video_mm_kwargs_item = mm_kwargs[current_item_idx + video_idx]
-                    with self.timed_encoder_operation(
-                        should_time, mm_lora_refs, current_item_idx + video_idx, 1
-                    ):
-                        _, _, micro_batch_mm_inputs = next(
-                            group_and_batch_mm_kwargs(
-                                [video_mm_kwargs_item],
-                                device=self.device,
-                                pin_memory=self.pin_memory,
-                            )
-                        )
+                batch_outputs: MultiModalEmbeddings
 
-                        micro_batch_outputs = model.embed_multimodal(
-                            **micro_batch_mm_inputs
-                        )
-
-                        batch_outputs_lst.extend(micro_batch_outputs)
-
-                batch_outputs = batch_outputs_lst
-            else:
-                # Run the encoder.
-                # `batch_outputs` is either of the following:
-                # 1. A tensor of shape (num_items, feature_size, hidden_size)
-                # in case feature_size is fixed across all multimodal items.
-                # 2. A list or tuple (length: num_items) of tensors,
-                # each of shape (feature_size, hidden_size) in case the feature
-                # size is dynamic depending on the input multimodal items.
-
-                with self.timed_encoder_operation(
-                    should_time, mm_lora_refs, current_item_idx, num_items
+                # EVS and dynamic res video related change.
+                # (ekhvedchenia): Temporary hack to limit peak memory usage when
+                # processing multimodal data. This solves the issue with scheduler
+                # putting too many video samples into a single batch. Scheduler
+                # uses pruned vision tokens count to compare it versus compute
+                # budget which is incorrect (Either input media size or non-pruned
+                # output vision tokens count should be considered)
+                # dynamic res video for nemotron temporarily uses this hack via
+                # requires_sequential_video_encoding
+                # because it doesn't yet support video batching.
+                # TODO(ywang96): Fix memory profiling to take EVS into account and
+                # remove this hack.
+                if (
+                    (
+                        self.is_multimodal_pruning_enabled
+                        or self.requires_sequential_video_encoding
+                    )
+                    and modality == "video"
+                    and num_items > 1
                 ):
-                    cudagraph_output = None
-                    if (
-                        self.encoder_cudagraph_manager is not None
-                        and self.encoder_cudagraph_manager.supports_modality(modality)
+                    batch_outputs_lst = list[torch.Tensor]()
+                    for video_idx in range(num_items):
+                        video_mm_kwargs_item = mm_kwargs[current_item_idx + video_idx]
+                        with self.timed_encoder_operation(
+                            should_time, mm_lora_refs, current_item_idx + video_idx, 1
+                        ):
+                            _, _, micro_batch_mm_inputs = next(
+                                group_and_batch_mm_kwargs(
+                                    [video_mm_kwargs_item],
+                                    device=self.device,
+                                    pin_memory=self.pin_memory,
+                                )
+                            )
+
+                            micro_batch_outputs = model.embed_multimodal(
+                                **micro_batch_mm_inputs
+                            )
+
+                            batch_outputs_lst.extend(micro_batch_outputs)
+
+                    batch_outputs = batch_outputs_lst
+                else:
+                    # Run the encoder.
+                    # `batch_outputs` is either of the following:
+                    # 1. A tensor of shape (num_items, feature_size, hidden_size)
+                    # in case feature_size is fixed across all multimodal items.
+                    # 2. A list or tuple (length: num_items) of tensors,
+                    # each of shape (feature_size, hidden_size) in case the feature
+                    # size is dynamic depending on the input multimodal items.
+
+                    with self.timed_encoder_operation(
+                        should_time, mm_lora_refs, current_item_idx, num_items
                     ):
-                        cudagraph_output = self.encoder_cudagraph_manager.execute(
-                            mm_kwargs_batch,
-                        )
+                        cudagraph_output = None
+                        if (
+                            self.encoder_cudagraph_manager is not None
+                            and self.encoder_cudagraph_manager.supports_modality(
+                                modality
+                            )
+                        ):
+                            cudagraph_output = self.encoder_cudagraph_manager.execute(
+                                mm_kwargs_batch,
+                            )
 
-                    if cudagraph_output is not None:
-                        batch_outputs = cudagraph_output
-                    else:
-                        batch_outputs = model.embed_multimodal(**mm_kwargs_batch)
+                        if cudagraph_output is not None:
+                            batch_outputs = cudagraph_output
+                        else:
+                            batch_outputs = model.embed_multimodal(**mm_kwargs_batch)
 
-            sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=num_items)
-            encoder_outputs.extend(batch_outputs)
+                sanity_check_mm_encoder_outputs(
+                    batch_outputs, expected_num_items=num_items
+                )
+                encoder_outputs.extend(batch_outputs)
 
-            current_item_idx += num_items
+                current_item_idx += num_items
 
         # Cache the encoder outputs by mm_hash
         for mm_hash, output in zip(mm_hashes, encoder_outputs):
@@ -3273,9 +3286,13 @@ class GPUModelRunner(
                 scheduler_output,
                 encoder_cache=self.encoder_cache,
             ) as ec_connector_output:
-                with record_function_or_nullcontext("gpu_model_runner: vit_forward"):
-                    self._execute_mm_encoder(scheduler_output)
-                mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
+                self._execute_mm_encoder(scheduler_output)
+                with record_function_or_nullcontext(
+                    "gpu_model_runner: gather_mm_embeddings"
+                ):
+                    mm_embeds, is_mm_embed = self._gather_mm_embeddings(
+                        scheduler_output
+                    )
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
@@ -4064,6 +4081,43 @@ class GPUModelRunner(
         has_encoder_input = (
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
+
+        # Per-step token telemetry — used to correlate forward duration with
+        # prefill/decode batch shape. Emits a Python log line (DEBUG every
+        # step, INFO every 50 steps) and a zero-duration NVTX range named
+        # "step_meta: prefill=N decode=M total=T reqs=R" so the data is
+        # joinable with the forward marker by globalTid + timestamp.
+        n_active = self.input_batch.num_reqs
+        if n_active:
+            ncomp = self.input_batch.num_computed_tokens_cpu_tensor[:n_active]
+            nprompt = self.input_batch.num_prompt_tokens_cpu_tensor[:n_active]
+            is_prefilling_mask = (ncomp < nprompt).numpy()
+            per_req = np.array(
+                [
+                    scheduler_output.num_scheduled_tokens[r]
+                    for r in self.input_batch.req_ids[:n_active]
+                ],
+                dtype=np.int64,
+            )
+            prefill_tokens = int(per_req[is_prefilling_mask].sum())
+            decode_tokens = int(per_req[~is_prefilling_mask].sum())
+        else:
+            prefill_tokens = decode_tokens = 0
+        total_tokens = prefill_tokens + decode_tokens
+        self._step_log_counter += 1
+        _step_msg = (
+            f"step_tokens step={self._step_log_counter} "
+            f"prefill={prefill_tokens} decode={decode_tokens} "
+            f"total={total_tokens} num_reqs={n_active}"
+        )
+        logger.debug(_step_msg)
+        if self._step_log_counter % 50 == 0:
+            logger.info(_step_msg)
+        with record_function_or_nullcontext(
+            f"step_meta: prefill={prefill_tokens} decode={decode_tokens} "
+            f"total={total_tokens} reqs={n_active}"
+        ):
+            pass
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
