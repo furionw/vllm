@@ -14,6 +14,7 @@ from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorBase
 from vllm.logger import init_logger
 from vllm.v1.outputs import ECConnectorOutput
+from vllm.v1.utils import record_function_or_nullcontext
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -32,7 +33,8 @@ class ECConnectorModelRunnerMixin:
             logger.debug("Not have ec transfer please check")
             return
         connector = get_ec_transfer()
-        connector.save_caches(encoder_cache=encoder_cache, mm_hash=mm_hash)
+        with record_function_or_nullcontext("ec_connector: save"):
+            connector.save_caches(encoder_cache=encoder_cache, mm_hash=mm_hash)
 
     @staticmethod
     def maybe_get_ec_connector_output(
@@ -66,7 +68,8 @@ class ECConnectorModelRunnerMixin:
 
         # Load caches for consumer or both roles
         if ec_connector.is_consumer:
-            ec_connector.start_load_caches(encoder_cache, **kwargs)
+            with record_function_or_nullcontext("ec_connector: load"):
+                ec_connector.start_load_caches(encoder_cache, **kwargs)
 
         try:
             yield output
