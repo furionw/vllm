@@ -845,6 +845,17 @@ class NixlConnectorWorker:
         # This is not used for SSM layers, which use the counterpart `mamba_ssm_size`.
         self.block_len_per_layer = list[int]()
         for layer_name, cache_or_caches in xfer_buffers.items():
+            # KV-sharing layers are appended to the runner's cache mapping after
+            # the connector is initialized. They alias a cache that has already
+            # been registered and therefore do not have their own entry in
+            # ``_layer_specs``. Skip the alias before looking up its spec.
+            if (
+                isinstance(cache_or_caches, torch.Tensor)
+                and cache_or_caches.data_ptr() in seen_base_addresses
+            ):
+                logger.debug("Skipping %s because it's already seen", layer_name)
+                continue
+
             # NOTE (NickLucche) Hybrid SSM models assume a layout that is similar to
             # that of FI, with block laid out as in `get_backend_aware_kv_block_len`.
             # However, physical page_size may differ when kernel requires a specific

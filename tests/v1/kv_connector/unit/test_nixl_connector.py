@@ -1670,6 +1670,10 @@ def test_register_kv_caches(
                 "layer1": unique_tensor,
                 "layer2": shared_tensor,
             }
+            # Model-runner KV-sharing aliases are not present in the connector's
+            # original KVCacheConfig. Registration must deduplicate the alias
+            # before trying to look up a layer spec for it.
+            kv_caches["kv-sharing-layer"] = shared_tensor
 
             # Store tensor info for validation
             if is_blocks_first:
