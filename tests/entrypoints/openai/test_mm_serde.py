@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Roundtrip tests for multimodal serde used by the disagg generate endpoint."""
 
+import pytest
 import torch
 
 from vllm.entrypoints.serve.disagg.mm_serde import (
@@ -12,12 +13,15 @@ from vllm.entrypoints.serve.disagg.protocol import (
     MultiModalFeatures,
     PlaceholderRangeInfo,
 )
+from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.multimodal.inputs import (
     MultiModalBatchedField,
     MultiModalFieldElem,
     MultiModalFlatField,
     MultiModalKwargsItem,
+    MultiModalKwargsItems,
     MultiModalSharedField,
+    PlaceholderRange,
 )
 
 
@@ -109,3 +113,31 @@ def test_mm_features_with_kwargs_data():
 
     decoded = decode_mm_kwargs_item(features2.kwargs_data["image"][0])
     assert torch.equal(elem.data, decoded["pixel_values"].data)
+
+
+def test_sparse_placeholder_mask_roundtrip():
+    mask = torch.tensor([False, True, True, False], dtype=torch.bool)
+    engine_input = {
+        "type": "multimodal",
+        "prompt_token_ids": [1, 2, 3, 4, 5, 6],
+        "mm_kwargs": MultiModalKwargsItems({}),
+        "mm_hashes": {"audio": ["audio-hash"]},
+        "mm_placeholders": {
+            "audio": [PlaceholderRange(offset=1, length=4, is_embed=mask)]
+        },
+    }
+
+    features = OpenAIServingRender._extract_mm_features(engine_input)
+
+    assert features is not None
+    encoded = features.model_dump_json()
+    decoded = MultiModalFeatures.model_validate_json(encoded)
+    placeholder = decoded.mm_placeholders["audio"][0]
+    assert placeholder.offset == 1
+    assert placeholder.length == 4
+    assert placeholder.is_embed == [False, True, True, False]
+
+
+def test_sparse_placeholder_mask_length_is_validated():
+    with pytest.raises(ValueError, match="is_embed length"):
+        PlaceholderRangeInfo(offset=1, length=2, is_embed=[True])
