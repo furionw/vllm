@@ -54,7 +54,7 @@ def test_saves_newly_added_caches_for_every_producer(is_producer, is_consumer):
     saved = [call.kwargs["mm_hash"] for call in fake.save_caches.call_args_list]
     assert saved == (["mm_new"] if is_producer else [])
     assert fake.start_load_caches.called == is_consumer
-    fake.finish_load_caches.assert_called_once_with(encoder_cache)
+    assert fake.finish_load_caches.called == is_consumer
 
 
 def test_external_loads_are_not_saved_again_by_ec_both():
@@ -123,12 +123,42 @@ def test_worker_meta_is_reported_on_context_exit():
     assert fake.clear_connector_metadata.called
 
 
+def test_load_finish_precedes_reporting_and_metadata_clear():
+    connector, fake = _connector(is_consumer=True)
+
+    with connector.maybe_get_output(_scheduler_output()):
+        connector.wait_for_loads()
+
+    method_names = [call[0] for call in fake.mock_calls]
+    assert method_names.index("finish_load_caches") < method_names.index("get_finished")
+    assert method_names.index("get_finished") < method_names.index(
+        "build_connector_worker_meta"
+    )
+    assert method_names.index("build_connector_worker_meta") < method_names.index(
+        "clear_connector_metadata"
+    )
+
+
+def test_wait_for_loads_is_guarded_outside_bound_step():
+    connector, fake = _connector(is_consumer=True)
+
+    connector.wait_for_loads()
+    with connector.maybe_get_output(_scheduler_output()):
+        connector.wait_for_loads()
+        connector.wait_for_loads()
+    connector.wait_for_loads()
+
+    fake.finish_load_caches.assert_called_once_with(connector.encoder_cache)
+
+
 def test_no_forward_reports_without_running_the_model():
-    connector, _ = _connector()
+    connector, fake = _connector(is_consumer=True)
 
     output = connector.no_forward(_scheduler_output())
 
     assert output.ec_connector_output.ec_connector_worker_meta is WORKER_META
+    method_names = [call[0] for call in fake.mock_calls]
+    assert method_names.index("finish_load_caches") < method_names.index("get_finished")
 
     empty = NO_OP_EC_CONNECTOR.no_forward(_scheduler_output())
     assert empty is EMPTY_MODEL_RUNNER_OUTPUT

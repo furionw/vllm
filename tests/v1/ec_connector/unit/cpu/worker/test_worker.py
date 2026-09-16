@@ -276,7 +276,11 @@ def test_start_load_caches_copies_with_correct_shape_dtype_and_bytes(make_worker
         worker._region.blocks[idx].copy_(src_int8[i])
 
     encoder_cache: dict[str, torch.Tensor] = {}
-    worker.start_load_caches(encoder_cache, _meta(loads={"h": block_ids}))
+    with patch(
+        "vllm.distributed.ec_transfer.ec_connector.cpu.worker.current_platform.current_stream"
+    ) as current_stream:
+        worker.start_load_caches(encoder_cache, _meta(loads={"h": block_ids}))
+        current_stream.assert_not_called()
     assert encoder_cache == {}
     worker.finish_load_caches(encoder_cache)
 
@@ -444,6 +448,22 @@ def test_buffer_pool_is_reused_across_load_steps(make_worker):
     assert id(worker._buf_pool._pool[0].src_ptrs) == buf_id
 
 
+@_requires_cuda
+def test_start_load_caches_drains_stale_stage_before_dispatch(make_worker):
+    worker = make_worker()
+    worker._region.blocks[0].fill_(0x01)
+    worker._region.blocks[1].fill_(0x02)
+    encoder_cache: dict[str, torch.Tensor] = {}
+
+    worker.start_load_caches(encoder_cache, _meta(loads={"a": [0]}))
+    worker.start_load_caches(encoder_cache, _meta(loads={"b": [1]}))
+
+    assert "a" in encoder_cache
+    assert "b" not in encoder_cache
+    worker.finish_load_caches(encoder_cache)
+    assert "b" in encoder_cache
+
+
 # ── stream management ────────────────────────────────────────────────────────
 
 
@@ -535,12 +555,13 @@ def test_shutdown_calls_region_cleanup_and_swallows_errors(caplog_vllm):
     mock_region = Mock(spec=ECSharedRegion)
     worker._region = mock_region
     worker._load_stream = MagicMock()
-    worker._staged_load = None
+    worker._staged_load = _StagedLoad(MagicMock(), {"h": MagicMock()})
     worker._save_bufs = None
     worker._save_count = 0
 
     worker.shutdown()
     worker._load_stream.synchronize.assert_called_once()
+    assert worker._staged_load is None
     mock_region.cleanup.assert_called_once()
 
     mock_region.cleanup.side_effect = RuntimeError("boom")

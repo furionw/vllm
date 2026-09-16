@@ -64,13 +64,15 @@ class ECConnectorModelRunnerMixin:
         assert scheduler_output.ec_connector_metadata is not None
         ec_connector.bind_connector_metadata(scheduler_output.ec_connector_metadata)
 
-        # Load caches for consumer or both roles
-        if ec_connector.is_consumer:
-            ec_connector.start_load_caches(encoder_cache, **kwargs)
-
         try:
+            # V1 has no pre-gather hook, so retain its serialized load ordering.
+            if ec_connector.is_consumer:
+                ec_connector.start_load_caches(encoder_cache, **kwargs)
+                ec_connector.finish_load_caches(encoder_cache, **kwargs)
             yield output
         finally:
+            if ec_connector.is_consumer:
+                ec_connector.finish_load_caches(encoder_cache, **kwargs)
             output.finished_sending, output.finished_recving = (
                 ec_connector.get_finished(scheduler_output.finished_req_ids)
             )

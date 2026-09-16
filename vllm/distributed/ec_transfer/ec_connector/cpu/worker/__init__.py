@@ -142,6 +142,10 @@ class ECCPUWorker:
     ) -> None:
         """Enqueue one batched mmap-to-GPU copy without blocking compute."""
         if self._staged_load is not None:
+            logger.error(
+                "EC: stale staged load found at start_load_caches; "
+                "draining before new dispatch"
+            )
             self.finish_load_caches(encoder_cache)
         if not connector_metadata.loads:
             return
@@ -210,8 +214,14 @@ class ECCPUWorker:
         compute_stream.wait_stream(self._load_stream)
         staged.dst_buf.record_stream(compute_stream)
         for mm_hash, view in staged.views.items():
-            if mm_hash not in encoder_cache:
-                encoder_cache[mm_hash] = view
+            if mm_hash in encoder_cache:
+                logger.warning_once(
+                    "EC: staged load collided with resident encoder cache entry %s; "
+                    "preserving the resident entry",
+                    mm_hash,
+                )
+                continue
+            encoder_cache[mm_hash] = view
         self._staged_load = None
 
     def shutdown(self) -> None:

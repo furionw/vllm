@@ -181,11 +181,15 @@ class ECConnectorBase(ABC):
     def finish_load_caches(
         self, encoder_cache: dict[str, torch.Tensor], **kwargs
     ) -> None:
-        """Wait for pending loads and publish them to the encoder cache."""
+        """Wait for pending loads and publish them to the encoder cache.
+
+        Called after ``bind_connector_metadata`` and before
+        ``clear_connector_metadata``.
+        """
         return None
 
     def externally_loaded_hashes(self) -> Collection[str]:
-        """Return hashes scheduled to be loaded by this connector step."""
+        """Return hashes scheduled to be loaded by the bound connector step."""
         return ()
 
     @abstractmethod

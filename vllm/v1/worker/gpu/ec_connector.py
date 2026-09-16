@@ -54,9 +54,13 @@ class ActiveECConnector(ECConnector):
         # Every producer offloads freshly computed encoder outputs, including
         # an ec_both node that also reloads them.
         self.save_new_caches = self.ec_connector.is_producer
+        self._loads_staged = False
 
     def wait_for_loads(self) -> None:
+        if not self._loads_staged:
+            return
         self.ec_connector.finish_load_caches(self.encoder_cache)
+        self._loads_staged = False
 
     def _finish_step(
         self,
@@ -68,11 +72,18 @@ class ActiveECConnector(ECConnector):
             output.finished_sending, output.finished_recving = (
                 self.ec_connector.get_finished(scheduler_output.finished_req_ids)
             )
+        except BaseException as exc:
+            error = exc
+
+        try:
             output.ec_connector_worker_meta = (
                 self.ec_connector.build_connector_worker_meta()
             )
         except BaseException as exc:
-            error = exc
+            if error is None:
+                error = exc
+            else:
+                logger.exception("Failed to build EC connector worker metadata")
 
         try:
             self.ec_connector.clear_connector_metadata()
@@ -101,6 +112,7 @@ class ActiveECConnector(ECConnector):
         try:
             try:
                 if ec_connector.is_consumer:
+                    self._loads_staged = True
                     ec_connector.start_load_caches(self.encoder_cache)
 
                 cached_hashes = (
@@ -130,11 +142,14 @@ class ActiveECConnector(ECConnector):
                     raise
         finally:
             try:
-                self._finish_step(output, scheduler_output)
-            except BaseException:
-                if primary_error is None:
-                    raise
-                logger.exception("Failed to finalize EC connector step")
+                try:
+                    self._finish_step(output, scheduler_output)
+                except BaseException:
+                    if primary_error is None:
+                        raise
+                    logger.exception("Failed to finalize EC connector step")
+            finally:
+                self._loads_staged = False
 
     def no_forward(
         self,
