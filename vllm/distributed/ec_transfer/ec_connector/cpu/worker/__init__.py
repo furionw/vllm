@@ -144,9 +144,9 @@ class ECCPUWorker:
         if self._staged_load is not None:
             logger.error(
                 "EC: stale staged load found at start_load_caches; "
-                "draining before new dispatch"
+                "discarding before new dispatch"
             )
-            self.finish_load_caches(encoder_cache)
+            self._discard_staged_load()
         if not connector_metadata.loads:
             return
 
@@ -203,6 +203,17 @@ class ECCPUWorker:
                 offset += n
 
         self._staged_load = _StagedLoad(dst_buf=dst_buf, views=views)
+
+    def _discard_staged_load(self) -> None:
+        """Retire a stale load without publishing prior-step embeddings."""
+        staged = self._staged_load
+        if staged is None:
+            return
+
+        compute_stream = current_platform.current_stream()
+        compute_stream.wait_stream(self._load_stream)
+        staged.dst_buf.record_stream(compute_stream)
+        self._staged_load = None
 
     def finish_load_caches(self, encoder_cache: dict[str, torch.Tensor]) -> None:
         """Order compute after a staged load, then publish its cache views."""

@@ -449,7 +449,7 @@ def test_buffer_pool_is_reused_across_load_steps(make_worker):
 
 
 @_requires_cuda
-def test_start_load_caches_drains_stale_stage_before_dispatch(make_worker):
+def test_start_load_caches_discards_stale_stage_before_dispatch(make_worker):
     worker = make_worker()
     worker._region.blocks[0].fill_(0x01)
     worker._region.blocks[1].fill_(0x02)
@@ -458,10 +458,35 @@ def test_start_load_caches_drains_stale_stage_before_dispatch(make_worker):
     worker.start_load_caches(encoder_cache, _meta(loads={"a": [0]}))
     worker.start_load_caches(encoder_cache, _meta(loads={"b": [1]}))
 
-    assert "a" in encoder_cache
+    assert "a" not in encoder_cache
     assert "b" not in encoder_cache
     worker.finish_load_caches(encoder_cache)
     assert "b" in encoder_cache
+
+
+@_requires_cuda
+def test_published_load_survives_eviction_until_consumer_finishes(make_worker):
+    worker = make_worker()
+    worker._region.blocks[0].fill_(0x01)
+    worker._region.blocks[1].fill_(0x02)
+    encoder_cache: dict[str, torch.Tensor] = {}
+
+    worker.start_load_caches(encoder_cache, _meta(loads={"a": [0]}))
+    worker.finish_load_caches(encoder_cache)
+
+    # Keep the consumer queued while the first cache entry is evicted and a
+    # same-sized destination is allocated on the load stream. record_stream()
+    # must prevent that allocation from reusing the first destination early.
+    torch.cuda._sleep(50_000_000)
+    observed = torch.empty_like(encoder_cache["a"])
+    observed.copy_(encoder_cache["a"])
+    del encoder_cache["a"]
+
+    worker.start_load_caches(encoder_cache, _meta(loads={"b": [1]}))
+    worker.finish_load_caches(encoder_cache)
+    torch.accelerator.synchronize()
+
+    assert torch.all(observed.view(torch.uint8) == 0x01)
 
 
 # ── stream management ────────────────────────────────────────────────────────
