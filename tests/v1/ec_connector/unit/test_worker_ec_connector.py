@@ -78,6 +78,7 @@ def test_model_error_remains_primary_when_load_drain_fails():
         pytest.raises(ValueError, match="model failed"),
         connector.maybe_get_output(_scheduler_output()),
     ):
+        connector.start_loads()
         raise ValueError("model failed")
 
     fake.clear_connector_metadata.assert_called_once()
@@ -136,6 +137,47 @@ def test_load_finish_precedes_reporting_and_metadata_clear():
     )
     assert method_names.index("build_connector_worker_meta") < method_names.index(
         "clear_connector_metadata"
+    )
+
+
+def test_load_starts_at_encoder_boundary():
+    connector, fake = _connector(is_consumer=True)
+    timeline = []
+    fake.start_load_caches.side_effect = lambda *_args, **_kwargs: timeline.append(
+        "start"
+    )
+    fake.finish_load_caches.side_effect = lambda *_args, **_kwargs: timeline.append(
+        "finish"
+    )
+
+    with connector.maybe_get_output(_scheduler_output()):
+        assert not fake.start_load_caches.called
+        connector.start_loads()
+        timeline.append("encoder")
+        connector.wait_for_loads()
+
+    assert timeline == ["start", "encoder", "finish"]
+
+
+def test_encoder_boundary_orders_load_after_current_stream():
+    connector, fake = _connector(is_consumer=True)
+    event = MagicMock()
+    stream = MagicMock()
+
+    with (
+        patch("vllm.v1.worker.gpu.ec_connector.torch.Event", return_value=event),
+        patch(
+            "vllm.v1.worker.gpu.ec_connector.current_platform.current_stream",
+            return_value=stream,
+        ),
+        connector.maybe_get_output(_scheduler_output()),
+    ):
+        connector.mark_encoder_ready()
+        connector.start_loads()
+
+    event.record.assert_called_once_with(stream)
+    fake.start_load_caches.assert_called_once_with(
+        connector.encoder_cache, wait_event=event
     )
 
 

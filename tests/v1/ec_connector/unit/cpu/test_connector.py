@@ -39,6 +39,11 @@ def test_worker_role_builds_only_worker(monkeypatch):
     metadata = ECCPUConnectorMetadata(loads={"h": [0]})
     c.bind_connector_metadata(metadata)
     cache: dict = {}
+    wait_event = MagicMock()
+    c.start_load_caches(cache, wait_event=wait_event)
+    fake_worker.start_load_caches.assert_called_once_with(
+        cache, connector_metadata=metadata, wait_event=wait_event
+    )
     c.finish_load_caches(cache)
     fake_worker.finish_load_caches.assert_called_once_with(cache)
 

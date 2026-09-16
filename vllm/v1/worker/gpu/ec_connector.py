@@ -10,6 +10,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorBase
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     ECConnectorOutput,
@@ -38,6 +39,12 @@ class ECConnector:
     ) -> ModelRunnerOutput:
         return EMPTY_MODEL_RUNNER_OUTPUT
 
+    def start_loads(self) -> None:
+        return None
+
+    def mark_encoder_ready(self) -> None:
+        return None
+
     def wait_for_loads(self) -> None:
         return None
 
@@ -54,13 +61,43 @@ class ActiveECConnector(ECConnector):
         # Every producer offloads freshly computed encoder outputs, including
         # an ec_both node that also reloads them.
         self.save_new_caches = self.ec_connector.is_producer
+        self._loads_pending = False
         self._loads_staged = False
+        self._load_start_event: torch.Event | None = None
+
+    def mark_encoder_ready(self) -> None:
+        if not self._loads_pending:
+            return
+        self._load_start_event = torch.Event()
+        self._load_start_event.record(current_platform.current_stream())
+
+    def start_loads(self) -> None:
+        if not self._loads_pending:
+            return
+        self._loads_pending = False
+        self._loads_staged = True
+        try:
+            self.ec_connector.start_load_caches(
+                self.encoder_cache, wait_event=self._load_start_event
+            )
+        except BaseException:
+            try:
+                self._finish_started_loads()
+            except BaseException:
+                logger.exception("Failed to drain EC loads after dispatch failure")
+            raise
+
+    def _finish_started_loads(self) -> None:
+        if self._loads_staged:
+            self.ec_connector.finish_load_caches(self.encoder_cache)
+            self._loads_staged = False
+        self._load_start_event = None
 
     def wait_for_loads(self) -> None:
-        if not self._loads_staged:
-            return
-        self.ec_connector.finish_load_caches(self.encoder_cache)
-        self._loads_staged = False
+        # A cache-hit-only step never runs the encoder callback, so dispatch
+        # the load here immediately before gathering as a fallback.
+        self.start_loads()
+        self._finish_started_loads()
 
     def _finish_step(
         self,
@@ -112,8 +149,7 @@ class ActiveECConnector(ECConnector):
         try:
             try:
                 if ec_connector.is_consumer:
-                    self._loads_staged = True
-                    ec_connector.start_load_caches(self.encoder_cache)
+                    self._loads_pending = True
 
                 cached_hashes = (
                     set(self.encoder_cache)
@@ -124,8 +160,9 @@ class ActiveECConnector(ECConnector):
                 yield output
             except BaseException as exc:
                 primary_error = exc
+                self._loads_pending = False
                 try:
-                    self.wait_for_loads()
+                    self._finish_started_loads()
                 except BaseException:
                     logger.exception("Failed to finish EC loads after model failure")
                 raise
@@ -149,7 +186,9 @@ class ActiveECConnector(ECConnector):
                         raise
                     logger.exception("Failed to finalize EC connector step")
             finally:
+                self._loads_pending = False
                 self._loads_staged = False
+                self._load_start_event = None
 
     def no_forward(
         self,

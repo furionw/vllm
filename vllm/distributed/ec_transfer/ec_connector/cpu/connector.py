@@ -71,7 +71,9 @@ class ECCPUConnector(ECConnectorBase):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, ECCPUConnectorMetadata)
         self.connector_worker.start_load_caches(
-            encoder_cache, connector_metadata=metadata
+            encoder_cache,
+            connector_metadata=metadata,
+            wait_event=kwargs.get("wait_event"),
         )
 
     def finish_load_caches(

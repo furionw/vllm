@@ -426,26 +426,22 @@ def test_buffer_pool_is_reused_across_save_steps(make_worker):
 
 
 @_requires_cuda
-def test_buffer_pool_is_reused_across_load_steps(make_worker):
-    """After start_load_caches, descriptor buffers are returned to the pool
-    and reused on the next call."""
+def test_load_keeps_pinned_staging_alive_until_finish(make_worker):
     worker = make_worker()
     worker._region.blocks[0].fill_(0x01)
-    worker._region.blocks[1].fill_(0x02)
 
     encoder_cache: dict[str, torch.Tensor] = {}
     worker.start_load_caches(encoder_cache, _meta(loads={"a": [0]}))
+
+    staged = worker._staged_load
+    assert staged is not None
+    assert staged.src_buf is not None
+    assert staged.src_buf.is_pinned() == worker._region.is_pinned
+    assert "a" not in encoder_cache
+
     worker.finish_load_caches(encoder_cache)
-
-    assert len(worker._buf_pool._pool) == 1
-    buf_id = id(worker._buf_pool._pool[0].src_ptrs)
-
-    encoder_cache2: dict[str, torch.Tensor] = {}
-    worker.start_load_caches(encoder_cache2, _meta(loads={"b": [1]}))
-    worker.finish_load_caches(encoder_cache2)
-
-    assert len(worker._buf_pool._pool) == 1
-    assert id(worker._buf_pool._pool[0].src_ptrs) == buf_id
+    assert worker._staged_load is None
+    assert "a" in encoder_cache
 
 
 @_requires_cuda

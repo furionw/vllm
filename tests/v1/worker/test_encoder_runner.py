@@ -9,11 +9,12 @@ and tolerated (token-embedding fallback) when it is not, while a miss within
 the processed range still fails loudly.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 import torch
+import torch.nn as nn
 
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -156,6 +157,55 @@ def test_before_gather_runs_before_all_decode_early_return():
 
     callback.assert_called_once_with()
     assert mm_embeds == []
+
+
+def test_load_callbacks_bracket_encoder_dispatch():
+    timeline = []
+
+    class Block(nn.Module):
+        def forward(self, value):
+            timeline.append("block")
+            return value
+
+    class Tower(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = nn.ModuleList([Block(), Block()])
+
+        def forward(self, value):
+            timeline.append("input-projection")
+            for block in self.blocks:
+                value = block(value)
+            return value
+
+    class Model(nn.Module):
+        _tower_model_names = ["tower"]
+
+        def __init__(self):
+            super().__init__()
+            self.tower = Tower()
+
+        def embed_multimodal(self, **_kwargs):
+            return [self.tower(torch.ones(1, HIDDEN))]
+
+    runner = EncoderRunner(
+        model=Model(),
+        max_num_tokens=64,
+        hidden_size=HIDDEN,
+        encoder_cache=EncoderCache(),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    runner.set_before_execute(lambda: timeline.append("ready"))
+    runner.set_after_execute(lambda: timeline.append("start"))
+
+    with patch(
+        "vllm.v1.worker.gpu.mm.encoder_runner.group_and_batch_mm_kwargs",
+        return_value=iter([("image", 1, {})]),
+    ):
+        runner.execute_mm_encoder([("image", MagicMock())])
+
+    assert timeline == ["ready", "input-projection", "block", "block", "start"]
 
 
 @pytest.mark.parametrize("draft_lookahead", [0, 1])

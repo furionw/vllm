@@ -152,10 +152,16 @@ def test_v2_load_model_with_dummy_weights_skips_eplb_registration(monkeypatch):
     assert runner.eplb_state.async_started is False
 
 
-def test_v2_load_model_wires_ec_load_before_encoder_gather(monkeypatch):
+def test_v2_load_model_wires_ec_load_around_encoder_execution(monkeypatch):
     FakeEplbState.instances.clear()
     model = SimpleNamespace(is_moe=False)
-    encoder_runner = SimpleNamespace(set_before_gather=MagicMock())
+    encoder_runner = SimpleNamespace(
+        set_before_execute=MagicMock(),
+        set_after_execute=MagicMock(),
+        set_before_gather=MagicMock(),
+    )
+    mark_encoder_ready = MagicMock()
+    start_loads = MagicMock()
     wait_for_loads = MagicMock()
 
     monkeypatch.setattr(mrv2, "DeviceMemoryProfiler", FakeMemoryProfiler)
@@ -177,10 +183,16 @@ def test_v2_load_model_wires_ec_load_before_encoder_gather(monkeypatch):
 
     runner = _make_runner(
         is_last_pp_rank=False,
-        ec_connector=SimpleNamespace(wait_for_loads=wait_for_loads),
+        ec_connector=SimpleNamespace(
+            mark_encoder_ready=mark_encoder_ready,
+            start_loads=start_loads,
+            wait_for_loads=wait_for_loads,
+        ),
     )
     mrv2.GPUModelRunner.load_model(runner)
 
+    encoder_runner.set_before_execute.assert_called_once_with(mark_encoder_ready)
+    encoder_runner.set_after_execute.assert_called_once_with(start_loads)
     encoder_runner.set_before_gather.assert_called_once_with(wait_for_loads)
 
 
