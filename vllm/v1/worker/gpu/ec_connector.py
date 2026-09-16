@@ -9,6 +9,8 @@ import torch
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorBase
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     ECConnectorOutput,
@@ -18,6 +20,8 @@ from vllm.v1.outputs import (
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+
+logger = init_logger(__name__)
 
 
 class ECConnector:
@@ -35,6 +39,15 @@ class ECConnector:
     ) -> ModelRunnerOutput:
         return EMPTY_MODEL_RUNNER_OUTPUT
 
+    def start_loads(self) -> None:
+        return None
+
+    def mark_encoder_ready(self) -> None:
+        return None
+
+    def wait_for_loads(self) -> None:
+        return None
+
 
 class ActiveECConnector(ECConnector):
     def __init__(
@@ -48,6 +61,76 @@ class ActiveECConnector(ECConnector):
         # Every producer offloads freshly computed encoder outputs, including
         # an ec_both node that also reloads them.
         self.save_new_caches = self.ec_connector.is_producer
+        self._loads_pending = False
+        self._loads_staged = False
+        self._load_start_event: torch.Event | None = None
+
+    def mark_encoder_ready(self) -> None:
+        if not self._loads_pending:
+            return
+        self._load_start_event = torch.Event()
+        self._load_start_event.record(current_platform.current_stream())
+
+    def start_loads(self) -> None:
+        if not self._loads_pending:
+            return
+        self._loads_pending = False
+        self._loads_staged = True
+        try:
+            self.ec_connector.start_load_caches(
+                self.encoder_cache, wait_event=self._load_start_event
+            )
+        except BaseException:
+            try:
+                self._finish_started_loads()
+            except BaseException:
+                logger.exception("Failed to drain EC loads after dispatch failure")
+            raise
+
+    def _finish_started_loads(self) -> None:
+        if self._loads_staged:
+            self.ec_connector.finish_load_caches(self.encoder_cache)
+            self._loads_staged = False
+        self._load_start_event = None
+
+    def wait_for_loads(self) -> None:
+        # A cache-hit-only step never runs the encoder callback, so dispatch
+        # the load here immediately before gathering as a fallback.
+        self.start_loads()
+        self._finish_started_loads()
+
+    def _finish_step(
+        self,
+        output: ECConnectorOutput,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        error: BaseException | None = None
+        try:
+            output.finished_sending, output.finished_recving = (
+                self.ec_connector.get_finished(scheduler_output.finished_req_ids)
+            )
+        except BaseException as exc:
+            error = exc
+
+        try:
+            output.ec_connector_worker_meta = (
+                self.ec_connector.build_connector_worker_meta()
+            )
+        except BaseException as exc:
+            if error is None:
+                error = exc
+            else:
+                logger.exception("Failed to build EC connector worker metadata")
+
+        try:
+            self.ec_connector.clear_connector_metadata()
+        except BaseException:
+            if error is None:
+                raise
+            logger.exception("Failed to clear EC connector metadata")
+
+        if error is not None:
+            raise error.with_traceback(error.__traceback__)
 
     @contextmanager
     def maybe_get_output(
@@ -62,23 +145,50 @@ class ActiveECConnector(ECConnector):
         assert scheduler_output.ec_connector_metadata is not None
         ec_connector.bind_connector_metadata(scheduler_output.ec_connector_metadata)
 
-        if ec_connector.is_consumer:
-            ec_connector.start_load_caches(self.encoder_cache)
-
-        cached_hashes = set(self.encoder_cache) if self.save_new_caches else None
+        primary_error: BaseException | None = None
         try:
-            yield output
-            if cached_hashes is not None:
-                for mm_hash in self.encoder_cache.keys() - cached_hashes:
-                    ec_connector.save_caches(
-                        encoder_cache=self.encoder_cache, mm_hash=mm_hash
-                    )
+            try:
+                if ec_connector.is_consumer:
+                    self._loads_pending = True
+
+                cached_hashes = (
+                    set(self.encoder_cache)
+                    | set(ec_connector.externally_loaded_hashes())
+                    if self.save_new_caches
+                    else None
+                )
+                yield output
+            except BaseException as exc:
+                primary_error = exc
+                self._loads_pending = False
+                try:
+                    self._finish_started_loads()
+                except BaseException:
+                    logger.exception("Failed to finish EC loads after model failure")
+                raise
+            else:
+                try:
+                    self.wait_for_loads()
+                    if cached_hashes is not None:
+                        for mm_hash in self.encoder_cache.keys() - cached_hashes:
+                            ec_connector.save_caches(
+                                encoder_cache=self.encoder_cache, mm_hash=mm_hash
+                            )
+                except BaseException as exc:
+                    primary_error = exc
+                    raise
         finally:
-            output.finished_sending, output.finished_recving = (
-                ec_connector.get_finished(scheduler_output.finished_req_ids)
-            )
-            output.ec_connector_worker_meta = ec_connector.build_connector_worker_meta()
-            ec_connector.clear_connector_metadata()
+            try:
+                try:
+                    self._finish_step(output, scheduler_output)
+                except BaseException:
+                    if primary_error is None:
+                        raise
+                    logger.exception("Failed to finalize EC connector step")
+            finally:
+                self._loads_pending = False
+                self._loads_staged = False
+                self._load_start_event = None
 
     def no_forward(
         self,

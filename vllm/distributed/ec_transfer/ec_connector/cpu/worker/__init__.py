@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Worker-side of the ECCPUConnector.
+"""Worker-side of the ECCPUConnector."""
 
-Thin, stateless across steps: opens the shared mmap region and uses the
-per-step connector metadata (`ECCPUConnectorMetadata`) to decide which
-blocks to copy in each direction.
-"""
-
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -34,6 +30,13 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+@dataclass
+class _StagedLoad:
+    dst_buf: torch.Tensor
+    views: dict[str, torch.Tensor]
+    src_buf: torch.Tensor | None = None
+
+
 class ECCPUWorker:
     """Worker-side delegate for the ECCPUConnector.
 
@@ -41,9 +44,10 @@ class ECCPUWorker:
       for each entry in `metadata.saves`. Descriptor buffers are filled
       directly in `save_caches`; the actual DMA is issued as a single
       batched call in `flush_saves`.
-    - Consumer role: copies `mmap[block_ids]` → `encoder_cache[mm_hash]`
-      for all entries in `metadata.loads` via a single `swap_blocks_batch`
-      call on the load stream.
+    - Consumer role: `start_load_caches` gathers `mmap[block_ids]` into pinned
+      host memory and enqueues one contiguous GPU copy on the load stream, and
+      `finish_load_caches` orders the compute stream after that copy before
+      publishing per-hash views into `encoder_cache`.
     - On `ec_both` nodes both paths run back-to-back in a single step.
     """
 
@@ -54,6 +58,7 @@ class ECCPUWorker:
 
         if is_pin_memory_available():
             self._region.pin_memory()
+        logger.info_once("EC CPU shared region pinned=%s", self._region.is_pinned)
 
         # All TP/PCP ranks hold identical encoder output. Only one rank
         # per mmap needs to write — saves host memory bandwidth.
@@ -71,6 +76,7 @@ class ECCPUWorker:
         # Active save buffer being filled during save_caches calls this step.
         self._save_bufs: DescriptorBuffers | None = None
         self._save_count: int = 0
+        self._staged_load: _StagedLoad | None = None
 
     def save_caches(
         self,
@@ -135,8 +141,15 @@ class ECCPUWorker:
         self,
         encoder_cache: dict[str, torch.Tensor],
         connector_metadata: ECCPUConnectorMetadata,
+        wait_event: torch.Event | None = None,
     ) -> None:
-        """Consumer path: single batched copy of all loads from mmap→GPU."""
+        """Enqueue one contiguous mmap-to-GPU copy without blocking compute."""
+        if self._staged_load is not None:
+            logger.error(
+                "EC: stale staged load found at start_load_caches; "
+                "discarding before new dispatch"
+            )
+            self._discard_staged_load()
         if not connector_metadata.loads:
             return
 
@@ -144,7 +157,6 @@ class ECCPUWorker:
         blocks = self._region.blocks
         dtype = self._dtype
         device_type = current_platform.device_type
-        src_base = blocks.data_ptr()
 
         # Pre-filter: only hashes not already in encoder_cache.
         load_items = {
@@ -157,43 +169,75 @@ class ECCPUWorker:
 
         total_blocks = sum(len(idxs) for idxs in load_items.values())
 
+        # Gather arbitrary mmap blocks into one pinned host allocation. A
+        # single tensor copy uses cudaMemcpyAsync and returns immediately;
+        # cuMemcpyBatchAsync can spend the full transfer duration inside the
+        # driver call for large descriptor counts, preventing Python from
+        # reaching the already-enqueued encoder work.
+        flat_block_ids = [block_idx for ids in load_items.values() for block_idx in ids]
+        block_indices = torch.tensor(flat_block_ids, dtype=torch.long)
+        src_buf = torch.empty(
+            total_blocks,
+            block_size,
+            dtype=torch.int8,
+            device="cpu",
+            pin_memory=self._region.is_pinned,
+        )
+        torch.index_select(blocks, 0, block_indices, out=src_buf)
+
         with current_platform.stream(self._load_stream):
+            if wait_event is not None:
+                self._load_stream.wait_event(wait_event)
             # Single contiguous destination buffer for all loads.
             dst_buf = torch.empty(
                 total_blocks, block_size, dtype=torch.int8, device=device_type
             )
-            dst_buf_base = dst_buf.data_ptr()
-
-            bufs = self._buf_pool.acquire(total_blocks)
-            src_ptrs = bufs.src_ptrs[:total_blocks]
-            dst_ptrs = bufs.dst_ptrs[:total_blocks]
-            sizes = bufs.sizes[:total_blocks]
-            sizes[:] = block_size
-
-            op_idx = 0
-            for block_ids in load_items.values():
-                for block_idx in block_ids:
-                    src_ptrs[op_idx] = src_base + block_idx * block_size
-                    dst_ptrs[op_idx] = dst_buf_base + op_idx * block_size
-                    op_idx += 1
-
-            swap_blocks_batch(src_ptrs, dst_ptrs, sizes, is_src_access_order_any=True)
-
-            self._buf_pool.release(bufs)
+            dst_buf.copy_(src_buf, non_blocking=True)
 
             # Slice contiguous buffer into per-hash views.
             offset = 0
+            views: dict[str, torch.Tensor] = {}
             for mm_hash, block_ids in load_items.items():
                 n = len(block_ids)
-                encoder_cache[mm_hash] = (
-                    dst_buf[offset : offset + n].view(dtype).reshape(n, -1)
-                )
+                views[mm_hash] = dst_buf[offset : offset + n].view(dtype).reshape(n, -1)
                 offset += n
 
-        current_platform.current_stream().wait_stream(self._load_stream)
+        self._staged_load = _StagedLoad(dst_buf=dst_buf, views=views, src_buf=src_buf)
+
+    def _discard_staged_load(self) -> None:
+        """Retire a stale load without publishing prior-step embeddings."""
+        staged = self._staged_load
+        if staged is None:
+            return
+
+        compute_stream = current_platform.current_stream()
+        compute_stream.wait_stream(self._load_stream)
+        staged.dst_buf.record_stream(compute_stream)
+        self._staged_load = None
+
+    def finish_load_caches(self, encoder_cache: dict[str, torch.Tensor]) -> None:
+        """Order compute after a staged load, then publish its cache views."""
+        staged = self._staged_load
+        if staged is None:
+            return
+
+        compute_stream = current_platform.current_stream()
+        compute_stream.wait_stream(self._load_stream)
+        staged.dst_buf.record_stream(compute_stream)
+        for mm_hash, view in staged.views.items():
+            if mm_hash in encoder_cache:
+                logger.warning_once(
+                    "EC: staged load collided with a resident encoder cache entry; "
+                    "preserving the resident entry"
+                )
+                logger.debug("EC: staged load collision for mm_hash=%s", mm_hash)
+                continue
+            encoder_cache[mm_hash] = view
+        self._staged_load = None
 
     def shutdown(self) -> None:
         self._load_stream.synchronize()
+        self._staged_load = None
         self._save_bufs = None
         self._save_count = 0
         try:

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
 import time
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
@@ -54,6 +54,9 @@ class EncoderRunner:
         self.enable_timing = enable_timing
         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
         self._timing_lock = threading.Lock()
+        self._before_execute: Callable[[], None] = lambda: None
+        self._after_execute: Callable[[], None] = lambda: None
+        self._before_gather: Callable[[], None] = lambda: None
 
         self.inputs_embeds = torch.zeros(
             max_num_tokens, hidden_size, dtype=dtype, device=device
@@ -140,9 +143,17 @@ class EncoderRunner:
         self, mm_kwargs: list[tuple[str, MultiModalKwargsItem]]
     ) -> list[torch.Tensor]:
         encoder_outputs: list[torch.Tensor] = []
+        first_batch = True
         for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
             mm_kwargs, device=self.device, pin_memory=PIN_MEMORY
         ):
+            if first_batch:
+                # The input copies for the first encoder batch have been
+                # enqueued on the compute stream. Mark this boundary so an
+                # external-cache transfer submitted after host dispatch can
+                # overlap with the encoder kernels that follow.
+                self._before_execute()
+                first_batch = False
             cg_manager = self.cudagraph_manager
             cudagraph_output = (
                 cg_manager.execute(mm_kwargs_batch)
@@ -158,6 +169,8 @@ class EncoderRunner:
             )
             sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=num_items)
             encoder_outputs.extend(batch_outputs)
+        if not first_batch:
+            self._after_execute()
         return encoder_outputs
 
     @contextmanager
@@ -190,6 +203,15 @@ class EncoderRunner:
             self.encoder_timing_registry.clear()
             return stats
 
+    def set_before_gather(self, callback: Callable[[], None]) -> None:
+        self._before_gather = callback
+
+    def set_before_execute(self, callback: Callable[[], None]) -> None:
+        self._before_execute = callback
+
+    def set_after_execute(self, callback: Callable[[], None]) -> None:
+        self._after_execute = callback
+
     def gather_mm_embeddings(
         self,
         req_ids: list[str],
@@ -200,6 +222,7 @@ class EncoderRunner:
         num_computed_tokens: np.ndarray,
         draft_lookahead: int = 0,
     ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        self._before_gather()
         if draft_lookahead:
             num_computed_tokens = num_computed_tokens + draft_lookahead
 

@@ -8,6 +8,7 @@ GPU copy plumbing. An ec_both instance reuses encoder outputs it has already
 offloaded to CPU instead of recomputing them.
 """
 
+from collections.abc import Collection
 from typing import TYPE_CHECKING
 
 import torch
@@ -70,8 +71,22 @@ class ECCPUConnector(ECConnectorBase):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, ECCPUConnectorMetadata)
         self.connector_worker.start_load_caches(
-            encoder_cache, connector_metadata=metadata
+            encoder_cache,
+            connector_metadata=metadata,
+            wait_event=kwargs.get("wait_event"),
         )
+
+    def finish_load_caches(
+        self, encoder_cache: dict[str, torch.Tensor], **kwargs
+    ) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.finish_load_caches(encoder_cache)
+
+    def externally_loaded_hashes(self) -> Collection[str]:
+        metadata = self._connector_metadata
+        if not isinstance(metadata, ECCPUConnectorMetadata):
+            return ()
+        return metadata.loads.keys()
 
     def save_caches(
         self, encoder_cache: dict[str, torch.Tensor], mm_hash: str, **kwargs

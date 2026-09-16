@@ -3,6 +3,9 @@
 from unittest.mock import MagicMock
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
+from vllm.distributed.ec_transfer.ec_connector.cpu.common import (
+    ECCPUConnectorMetadata,
+)
 from vllm.distributed.ec_transfer.ec_connector.cpu.connector import ECCPUConnector
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 
@@ -32,6 +35,27 @@ def test_worker_role_builds_only_worker(monkeypatch):
     c = ECCPUConnector(_cfg(), ECConnectorRole.WORKER)
     assert c.connector_worker is fake_worker
     assert c.connector_scheduler is None
+
+    metadata = ECCPUConnectorMetadata(loads={"h": [0]})
+    c.bind_connector_metadata(metadata)
+    cache: dict = {}
+    wait_event = MagicMock()
+    c.start_load_caches(cache, wait_event=wait_event)
+    fake_worker.start_load_caches.assert_called_once_with(
+        cache, connector_metadata=metadata, wait_event=wait_event
+    )
+    c.finish_load_caches(cache)
+    fake_worker.finish_load_caches.assert_called_once_with(cache)
+
+
+def test_worker_reports_hashes_scheduled_for_external_load(monkeypatch):
+    monkeypatch.setattr(ECCPUConnector, "_make_worker", lambda self, cfg: MagicMock())
+    c = ECCPUConnector(_cfg(), ECConnectorRole.WORKER)
+    metadata = ECCPUConnectorMetadata(loads={"a": [0], "b": [1]})
+
+    assert tuple(c.externally_loaded_hashes()) == ()
+    c.bind_connector_metadata(metadata)
+    assert set(c.externally_loaded_hashes()) == {"a", "b"}
 
 
 def test_request_finished_inherited_noop(monkeypatch):

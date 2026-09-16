@@ -36,7 +36,10 @@ from vllm.distributed.ec_transfer.ec_connector.cpu.common import (
 from vllm.distributed.ec_transfer.ec_connector.cpu.ec_shared_region import (
     ECSharedRegion,
 )
-from vllm.distributed.ec_transfer.ec_connector.cpu.worker import ECCPUWorker
+from vllm.distributed.ec_transfer.ec_connector.cpu.worker import (
+    ECCPUWorker,
+    _StagedLoad,
+)
 
 # ── shape constants ──────────────────────────────────────────────────────────
 
@@ -273,7 +276,13 @@ def test_start_load_caches_copies_with_correct_shape_dtype_and_bytes(make_worker
         worker._region.blocks[idx].copy_(src_int8[i])
 
     encoder_cache: dict[str, torch.Tensor] = {}
-    worker.start_load_caches(encoder_cache, _meta(loads={"h": block_ids}))
+    with patch(
+        "vllm.distributed.ec_transfer.ec_connector.cpu.worker.current_platform.current_stream"
+    ) as current_stream:
+        worker.start_load_caches(encoder_cache, _meta(loads={"h": block_ids}))
+        current_stream.assert_not_called()
+    assert encoder_cache == {}
+    worker.finish_load_caches(encoder_cache)
 
     out = encoder_cache["h"]
     assert out.is_cuda, "consumer worker must place the tensor on the GPU"
@@ -292,6 +301,7 @@ def test_start_load_caches_preserves_existing_encoder_cache_entry(make_worker):
     sentinel = torch.full((_HIDDEN_DIM,), 7.0, dtype=_DTYPE, device="cuda")
     encoder_cache = {"h": sentinel}
     worker.start_load_caches(encoder_cache, _meta(loads={"h": [0]}))
+    worker.finish_load_caches(encoder_cache)
 
     assert encoder_cache["h"] is sentinel, (
         "existing encoder_cache entry must not be replaced"
@@ -327,6 +337,8 @@ def test_start_load_caches_skips_cached_and_loads_new_in_same_step(make_worker):
         encoder_cache,
         _meta(loads={"cached_h": [0], "new_h": new_block_ids}),
     )
+    assert "new_h" not in encoder_cache
+    worker.finish_load_caches(encoder_cache)
 
     assert encoder_cache["cached_h"] is cached_tensor
     assert "new_h" in encoder_cache
@@ -356,6 +368,7 @@ def test_start_load_caches_works_on_all_ranks(make_worker, tp_rank, pcp_rank):
 
     encoder_cache: dict[str, torch.Tensor] = {}
     worker.start_load_caches(encoder_cache, _meta(loads={"h": block_ids}))
+    worker.finish_load_caches(encoder_cache)
 
     out = encoder_cache["h"]
     assert out.is_cuda
@@ -380,6 +393,7 @@ def test_save_then_load_round_trips_bytes(make_worker):
 
     encoder_cache: dict[str, torch.Tensor] = {}
     worker.start_load_caches(encoder_cache, _meta(loads={"h": block_ids}))
+    worker.finish_load_caches(encoder_cache)
 
     out = encoder_cache["h"]
     assert out.shape == src.shape
@@ -412,24 +426,63 @@ def test_buffer_pool_is_reused_across_save_steps(make_worker):
 
 
 @_requires_cuda
-def test_buffer_pool_is_reused_across_load_steps(make_worker):
-    """After start_load_caches, descriptor buffers are returned to the pool
-    and reused on the next call."""
+def test_load_keeps_pinned_staging_alive_until_finish(make_worker):
     worker = make_worker()
     worker._region.blocks[0].fill_(0x01)
-    worker._region.blocks[1].fill_(0x02)
 
     encoder_cache: dict[str, torch.Tensor] = {}
     worker.start_load_caches(encoder_cache, _meta(loads={"a": [0]}))
 
-    assert len(worker._buf_pool._pool) == 1
-    buf_id = id(worker._buf_pool._pool[0].src_ptrs)
+    staged = worker._staged_load
+    assert staged is not None
+    assert staged.src_buf is not None
+    assert staged.src_buf.is_pinned() == worker._region.is_pinned
+    assert "a" not in encoder_cache
 
-    encoder_cache2: dict[str, torch.Tensor] = {}
-    worker.start_load_caches(encoder_cache2, _meta(loads={"b": [1]}))
+    worker.finish_load_caches(encoder_cache)
+    assert worker._staged_load is None
+    assert "a" in encoder_cache
 
-    assert len(worker._buf_pool._pool) == 1
-    assert id(worker._buf_pool._pool[0].src_ptrs) == buf_id
+
+@_requires_cuda
+def test_start_load_caches_discards_stale_stage_before_dispatch(make_worker):
+    worker = make_worker()
+    worker._region.blocks[0].fill_(0x01)
+    worker._region.blocks[1].fill_(0x02)
+    encoder_cache: dict[str, torch.Tensor] = {}
+
+    worker.start_load_caches(encoder_cache, _meta(loads={"a": [0]}))
+    worker.start_load_caches(encoder_cache, _meta(loads={"b": [1]}))
+
+    assert "a" not in encoder_cache
+    assert "b" not in encoder_cache
+    worker.finish_load_caches(encoder_cache)
+    assert "b" in encoder_cache
+
+
+@_requires_cuda
+def test_published_load_survives_eviction_until_consumer_finishes(make_worker):
+    worker = make_worker()
+    worker._region.blocks[0].fill_(0x01)
+    worker._region.blocks[1].fill_(0x02)
+    encoder_cache: dict[str, torch.Tensor] = {}
+
+    worker.start_load_caches(encoder_cache, _meta(loads={"a": [0]}))
+    worker.finish_load_caches(encoder_cache)
+
+    # Keep the consumer queued while the first cache entry is evicted and a
+    # same-sized destination is allocated on the load stream. record_stream()
+    # must prevent that allocation from reusing the first destination early.
+    torch.cuda._sleep(50_000_000)
+    observed = torch.empty_like(encoder_cache["a"])
+    observed.copy_(encoder_cache["a"])
+    del encoder_cache["a"]
+
+    worker.start_load_caches(encoder_cache, _meta(loads={"b": [1]}))
+    worker.finish_load_caches(encoder_cache)
+    torch.accelerator.synchronize()
+
+    assert torch.all(observed.view(torch.uint8) == 0x01)
 
 
 # ── stream management ────────────────────────────────────────────────────────
@@ -440,6 +493,33 @@ def test_stream_initialized_at_construction(make_worker):
     """``_load_stream`` must be a fully initialized CUDA stream."""
     worker = make_worker()
     assert isinstance(worker._load_stream, torch.cuda.Stream)
+
+
+def test_finish_load_caches_orders_compute_and_preserves_collisions():
+    worker = object.__new__(ECCPUWorker)
+    worker._load_stream = MagicMock()
+    dst_buf = MagicMock()
+    loaded_existing = MagicMock()
+    loaded_new = MagicMock()
+    worker._staged_load = _StagedLoad(
+        dst_buf=dst_buf,
+        views={"existing": loaded_existing, "new": loaded_new},
+    )
+    existing = MagicMock()
+    encoder_cache = {"existing": existing}
+    compute_stream = MagicMock()
+
+    with patch(
+        "vllm.distributed.ec_transfer.ec_connector.cpu.worker.current_platform.current_stream",
+        return_value=compute_stream,
+    ):
+        worker.finish_load_caches(encoder_cache)
+        worker.finish_load_caches(encoder_cache)
+
+    compute_stream.wait_stream.assert_called_once_with(worker._load_stream)
+    dst_buf.record_stream.assert_called_once_with(compute_stream)
+    assert encoder_cache == {"existing": existing, "new": loaded_new}
+    assert worker._staged_load is None
 
 
 # ── lifecycle ────────────────────────────────────────────────────────────────
@@ -496,11 +576,13 @@ def test_shutdown_calls_region_cleanup_and_swallows_errors(caplog_vllm):
     mock_region = Mock(spec=ECSharedRegion)
     worker._region = mock_region
     worker._load_stream = MagicMock()
+    worker._staged_load = _StagedLoad(MagicMock(), {"h": MagicMock()})
     worker._save_bufs = None
     worker._save_count = 0
 
     worker.shutdown()
     worker._load_stream.synchronize.assert_called_once()
+    assert worker._staged_load is None
     mock_region.cleanup.assert_called_once()
 
     mock_region.cleanup.side_effect = RuntimeError("boom")
@@ -588,6 +670,8 @@ def test_e2e_scheduler_worker_save_then_load(make_worker, monkeypatch):
 
     load_cache: dict[str, torch.Tensor] = {}
     worker.start_load_caches(load_cache, meta_load)
+    assert load_cache == {}
+    worker.finish_load_caches(load_cache)
 
     out = load_cache["img_001"]
     assert out.is_cuda

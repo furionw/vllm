@@ -64,15 +64,46 @@ class ECConnectorModelRunnerMixin:
         assert scheduler_output.ec_connector_metadata is not None
         ec_connector.bind_connector_metadata(scheduler_output.ec_connector_metadata)
 
-        # Load caches for consumer or both roles
-        if ec_connector.is_consumer:
-            ec_connector.start_load_caches(encoder_cache, **kwargs)
-
+        primary_error: BaseException | None = None
         try:
-            yield output
+            try:
+                # V1 has no pre-gather hook, so retain its serialized load ordering.
+                if ec_connector.is_consumer:
+                    ec_connector.start_load_caches(encoder_cache, **kwargs)
+                    ec_connector.finish_load_caches(encoder_cache, **kwargs)
+                yield output
+            except BaseException as exc:
+                primary_error = exc
+                raise
         finally:
-            output.finished_sending, output.finished_recving = (
-                ec_connector.get_finished(scheduler_output.finished_req_ids)
-            )
+            cleanup_error: BaseException | None = None
+            if ec_connector.is_consumer:
+                try:
+                    ec_connector.finish_load_caches(encoder_cache, **kwargs)
+                except BaseException as exc:
+                    cleanup_error = exc
+                    if primary_error is not None:
+                        logger.exception(
+                            "Failed to finish EC loads after model failure"
+                        )
 
-            ec_connector.clear_connector_metadata()
+            try:
+                output.finished_sending, output.finished_recving = (
+                    ec_connector.get_finished(scheduler_output.finished_req_ids)
+                )
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                else:
+                    logger.exception("Failed to query finished EC transfers")
+
+            try:
+                ec_connector.clear_connector_metadata()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                else:
+                    logger.exception("Failed to clear EC connector metadata")
+
+            if primary_error is None and cleanup_error is not None:
+                raise cleanup_error.with_traceback(cleanup_error.__traceback__)
