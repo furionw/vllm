@@ -387,6 +387,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
+        encoder_runner = getattr(self.model_state, "encoder_runner", None)
+        if encoder_runner is not None:
+            encoder_runner.set_before_gather(self.ec_connector.wait_for_loads)
 
         self.decode_query_len = (
             self.num_speculative_steps

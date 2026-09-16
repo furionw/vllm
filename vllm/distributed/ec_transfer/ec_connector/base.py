@@ -26,6 +26,7 @@ The class provides the following primitives:
 
 import enum
 from abc import ABC, abstractmethod
+from collections.abc import Collection
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -176,6 +177,16 @@ class ECConnectorBase(ABC):
             kwargs (dict): Additional keyword arguments for the connector.
         """
         pass
+
+    def finish_load_caches(
+        self, encoder_cache: dict[str, torch.Tensor], **kwargs
+    ) -> None:
+        """Wait for pending loads and publish them to the encoder cache."""
+        return None
+
+    def externally_loaded_hashes(self) -> Collection[str]:
+        """Return hashes scheduled to be loaded by this connector step."""
+        return ()
 
     @abstractmethod
     def save_caches(

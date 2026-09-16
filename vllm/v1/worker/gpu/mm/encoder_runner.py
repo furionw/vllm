@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
 import time
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
@@ -54,6 +54,7 @@ class EncoderRunner:
         self.enable_timing = enable_timing
         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
         self._timing_lock = threading.Lock()
+        self._before_gather: Callable[[], None] = lambda: None
 
         self.inputs_embeds = torch.zeros(
             max_num_tokens, hidden_size, dtype=dtype, device=device
@@ -190,6 +191,9 @@ class EncoderRunner:
             self.encoder_timing_registry.clear()
             return stats
 
+    def set_before_gather(self, callback: Callable[[], None]) -> None:
+        self._before_gather = callback
+
     def gather_mm_embeddings(
         self,
         req_ids: list[str],
@@ -200,6 +204,7 @@ class EncoderRunner:
         num_computed_tokens: np.ndarray,
         draft_lookahead: int = 0,
     ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        self._before_gather()
         if draft_lookahead:
             num_computed_tokens = num_computed_tokens + draft_lookahead
 

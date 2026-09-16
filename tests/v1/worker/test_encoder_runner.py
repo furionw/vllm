@@ -124,6 +124,40 @@ def test_target_path_raises_on_encoder_cache_miss():
         _gather(runner, num_scheduled=8, draft_lookahead=0)
 
 
+def test_before_gather_can_publish_deferred_cache_entry():
+    feature = _feature("h0", offset=0, length=8)
+    runner = _make_runner([feature], cached=[])
+    callback = MagicMock(
+        side_effect=lambda: runner.encoder_cache.encoder_outputs.__setitem__(
+            "h0", torch.ones(8, HIDDEN)
+        )
+    )
+    runner.set_before_gather(callback)
+
+    mm_embeds, _ = _gather(runner, num_scheduled=8, draft_lookahead=0)
+
+    callback.assert_called_once_with()
+    assert len(mm_embeds) == 1
+
+
+def test_before_gather_runs_before_all_decode_early_return():
+    runner = _make_runner([], [])
+    callback = MagicMock()
+    runner.set_before_gather(callback)
+
+    mm_embeds, _ = runner.gather_mm_embeddings(
+        req_ids=["req0"],
+        total_num_scheduled_tokens=1,
+        num_scheduled_tokens=np.array([1]),
+        query_start_loc=np.array([0]),
+        prefill_lens=np.array([1]),
+        num_computed_tokens=np.array([1]),
+    )
+
+    callback.assert_called_once_with()
+    assert mm_embeds == []
+
+
 @pytest.mark.parametrize("draft_lookahead", [0, 1])
 def test_multi_request_batch_gathers_per_request(draft_lookahead):
     """Two prefilling requests in one batch: per-request query bounds must be
