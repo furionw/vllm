@@ -43,9 +43,10 @@ class ECCPUWorker:
       for each entry in `metadata.saves`. Descriptor buffers are filled
       directly in `save_caches`; the actual DMA is issued as a single
       batched call in `flush_saves`.
-    - Consumer role: copies `mmap[block_ids]` → `encoder_cache[mm_hash]`
-      for all entries in `metadata.loads` via a single `swap_blocks_batch`
-      call on the load stream.
+    - Consumer role: `start_load_caches` enqueues one batched
+      `mmap[block_ids]` → GPU copy on the load stream, and
+      `finish_load_caches` orders the compute stream after that copy before
+      publishing per-hash views into `encoder_cache`.
     - On `ec_both` nodes both paths run back-to-back in a single step.
     """
 
@@ -227,10 +228,10 @@ class ECCPUWorker:
         for mm_hash, view in staged.views.items():
             if mm_hash in encoder_cache:
                 logger.warning_once(
-                    "EC: staged load collided with resident encoder cache entry %s; "
-                    "preserving the resident entry",
-                    mm_hash,
+                    "EC: staged load collided with a resident encoder cache entry; "
+                    "preserving the resident entry"
                 )
+                logger.debug("EC: staged load collision for mm_hash=%s", mm_hash)
                 continue
             encoder_cache[mm_hash] = view
         self._staged_load = None

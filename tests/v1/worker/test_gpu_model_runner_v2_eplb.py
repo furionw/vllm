@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import torch
 
@@ -149,6 +150,38 @@ def test_v2_load_model_with_dummy_weights_skips_eplb_registration(monkeypatch):
     assert runner.eplb_state is not None
     assert runner.eplb_state.add_model_calls == []
     assert runner.eplb_state.async_started is False
+
+
+def test_v2_load_model_wires_ec_load_before_encoder_gather(monkeypatch):
+    FakeEplbState.instances.clear()
+    model = SimpleNamespace(is_moe=False)
+    encoder_runner = SimpleNamespace(set_before_gather=MagicMock())
+    wait_for_loads = MagicMock()
+
+    monkeypatch.setattr(mrv2, "DeviceMemoryProfiler", FakeMemoryProfiler)
+    monkeypatch.setattr(eplb, "EplbState", FakeEplbState)
+    monkeypatch.setattr(
+        mrv2,
+        "get_model_loader",
+        lambda load_config: SimpleNamespace(load_model=lambda **_: model),
+    )
+    monkeypatch.setattr(
+        mrv2,
+        "init_model_state",
+        lambda *args: SimpleNamespace(
+            num_new_sampled_tokens_per_step=1,
+            encoder_runner=encoder_runner,
+        ),
+    )
+    monkeypatch.setattr(eplb, "get_mixture_of_experts_model", lambda model: None)
+
+    runner = _make_runner(
+        is_last_pp_rank=False,
+        ec_connector=SimpleNamespace(wait_for_loads=wait_for_loads),
+    )
+    mrv2.GPUModelRunner.load_model(runner)
+
+    encoder_runner.set_before_gather.assert_called_once_with(wait_for_loads)
 
 
 def test_v2_setup_eplb_from_mapping_rebuilds_state(monkeypatch):
