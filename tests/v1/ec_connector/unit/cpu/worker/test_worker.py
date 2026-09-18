@@ -258,6 +258,68 @@ def test_save_caches_batches_multiple_hashes(make_worker):
 # ── start_load_caches ────────────────────────────────────────────────────────
 
 
+def test_start_load_caches_gathers_once_and_preserves_stream_wait():
+    """Loads use one CPU gather and one H2D without changing synchronization."""
+    worker = object.__new__(ECCPUWorker)
+    worker._dtype = _DTYPE
+    worker._load_stream = MagicMock()
+    worker._buf_pool = MagicMock()
+
+    blocks = MagicMock()
+    region = MagicMock()
+    region.blocks = blocks
+    region.block_size_bytes = _BLOCK_SIZE_BYTES
+    region.is_pinned = True
+    worker._region = region
+
+    block_indices = MagicMock()
+    src_buf = MagicMock()
+    dst_buf = MagicMock()
+    loaded_view = (
+        dst_buf.__getitem__.return_value.view.return_value.reshape.return_value
+    )
+    compute_stream = MagicMock()
+    encoder_cache: dict[str, torch.Tensor] = {}
+
+    with (
+        patch(
+            "vllm.distributed.ec_transfer.ec_connector.cpu.worker.torch.tensor",
+            return_value=block_indices,
+        ) as tensor_mock,
+        patch(
+            "vllm.distributed.ec_transfer.ec_connector.cpu.worker.torch.empty",
+            side_effect=[src_buf, dst_buf],
+        ) as empty_mock,
+        patch(
+            "vllm.distributed.ec_transfer.ec_connector.cpu.worker.torch.index_select"
+        ) as index_select_mock,
+        patch(
+            "vllm.distributed.ec_transfer.ec_connector.cpu.worker.current_platform.stream",
+            return_value=contextlib.nullcontext(),
+        ),
+        patch(
+            "vllm.distributed.ec_transfer.ec_connector.cpu.worker.current_platform.current_stream",
+            return_value=compute_stream,
+        ),
+    ):
+        worker.start_load_caches(
+            encoder_cache,
+            _meta(loads={"a": [3, 1], "b": [6]}),
+        )
+
+    tensor_mock.assert_called_once_with([3, 1, 6], dtype=torch.long)
+    assert empty_mock.call_args_list[0].kwargs == {
+        "dtype": torch.int8,
+        "device": "cpu",
+        "pin_memory": True,
+    }
+    index_select_mock.assert_called_once_with(blocks, 0, block_indices, out=src_buf)
+    dst_buf.copy_.assert_called_once_with(src_buf, non_blocking=True)
+    worker._buf_pool.acquire.assert_not_called()
+    compute_stream.wait_stream.assert_called_once_with(worker._load_stream)
+    assert encoder_cache == {"a": loaded_view, "b": loaded_view}
+
+
 @_requires_cuda
 def test_start_load_caches_copies_with_correct_shape_dtype_and_bytes(make_worker):
     """Single batched load across all hashes with correct byte→dtype→shape."""
@@ -412,9 +474,8 @@ def test_buffer_pool_is_reused_across_save_steps(make_worker):
 
 
 @_requires_cuda
-def test_buffer_pool_is_reused_across_load_steps(make_worker):
-    """After start_load_caches, descriptor buffers are returned to the pool
-    and reused on the next call."""
+def test_loads_do_not_use_descriptor_buffer_pool(make_worker):
+    """The contiguous load path must not build per-block DMA descriptors."""
     worker = make_worker()
     worker._region.blocks[0].fill_(0x01)
     worker._region.blocks[1].fill_(0x02)
@@ -422,14 +483,12 @@ def test_buffer_pool_is_reused_across_load_steps(make_worker):
     encoder_cache: dict[str, torch.Tensor] = {}
     worker.start_load_caches(encoder_cache, _meta(loads={"a": [0]}))
 
-    assert len(worker._buf_pool._pool) == 1
-    buf_id = id(worker._buf_pool._pool[0].src_ptrs)
+    assert worker._buf_pool._pool == []
 
     encoder_cache2: dict[str, torch.Tensor] = {}
     worker.start_load_caches(encoder_cache2, _meta(loads={"b": [1]}))
 
-    assert len(worker._buf_pool._pool) == 1
-    assert id(worker._buf_pool._pool[0].src_ptrs) == buf_id
+    assert worker._buf_pool._pool == []
 
 
 # ── stream management ────────────────────────────────────────────────────────

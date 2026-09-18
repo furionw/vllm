@@ -126,7 +126,7 @@ def test_pin_memory_success_sets_flag(region):
         patch("torch.cuda.cudart", return_value=fake_cudart),
     ):
         region.pin_memory()
-        assert region._is_pinned is True
+        assert region.is_pinned is True
         # cleanup must pair with cudaHostUnregister exactly once.
         region.cleanup()
         fake_cudart.cudaHostUnregister.assert_called_once()
@@ -147,7 +147,7 @@ def test_pin_memory_failure_leaves_flag_false():
             patch("torch.cuda.cudart", return_value=fake_cudart),
         ):
             r.pin_memory()
-            assert r._is_pinned is False
+            assert r.is_pinned is False
             # Now run cleanup and verify cudaHostUnregister was NOT called.
             r.cleanup()
             fake_cudart.cudaHostUnregister.assert_not_called()
@@ -159,7 +159,7 @@ def test_pin_memory_noop_without_cuda(region):
     """pin_memory is a no-op when CUDA is not available."""
     with patch("torch.cuda.is_available", return_value=False):
         region.pin_memory()
-        assert region._is_pinned is False
+        assert region.is_pinned is False
 
 
 # ── cleanup idempotency ───────────────────────────────────────────────────────

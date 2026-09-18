@@ -41,9 +41,9 @@ class ECCPUWorker:
       for each entry in `metadata.saves`. Descriptor buffers are filled
       directly in `save_caches`; the actual DMA is issued as a single
       batched call in `flush_saves`.
-    - Consumer role: copies `mmap[block_ids]` → `encoder_cache[mm_hash]`
-      for all entries in `metadata.loads` via a single `swap_blocks_batch`
-      call on the load stream.
+    - Consumer role: gathers `mmap[block_ids]` into contiguous pinned host
+      memory and copies the result to `encoder_cache[mm_hash]` with one H2D
+      operation on the load stream.
     - On `ec_both` nodes both paths run back-to-back in a single step.
     """
 
@@ -136,7 +136,7 @@ class ECCPUWorker:
         encoder_cache: dict[str, torch.Tensor],
         connector_metadata: ECCPUConnectorMetadata,
     ) -> None:
-        """Consumer path: single batched copy of all loads from mmap→GPU."""
+        """Consumer path: gather all loads and issue one contiguous H2D."""
         if not connector_metadata.loads:
             return
 
@@ -144,8 +144,6 @@ class ECCPUWorker:
         blocks = self._region.blocks
         dtype = self._dtype
         device_type = current_platform.device_type
-        src_base = blocks.data_ptr()
-
         # Pre-filter: only hashes not already in encoder_cache.
         load_items = {
             h: idxs
@@ -157,29 +155,28 @@ class ECCPUWorker:
 
         total_blocks = sum(len(idxs) for idxs in load_items.values())
 
+        # EC allocates one small block per multimodal token. Gather arbitrary
+        # mmap blocks on the CPU so the H2D path submits one contiguous copy
+        # instead of thousands of small transfers and their descriptors.
+        flat_block_ids = [
+            block_idx for block_ids in load_items.values() for block_idx in block_ids
+        ]
+        block_indices = torch.tensor(flat_block_ids, dtype=torch.long)
+        src_buf = torch.empty(
+            total_blocks,
+            block_size,
+            dtype=torch.int8,
+            device="cpu",
+            pin_memory=self._region.is_pinned,
+        )
+        torch.index_select(blocks, 0, block_indices, out=src_buf)
+
         with current_platform.stream(self._load_stream):
             # Single contiguous destination buffer for all loads.
             dst_buf = torch.empty(
                 total_blocks, block_size, dtype=torch.int8, device=device_type
             )
-            dst_buf_base = dst_buf.data_ptr()
-
-            bufs = self._buf_pool.acquire(total_blocks)
-            src_ptrs = bufs.src_ptrs[:total_blocks]
-            dst_ptrs = bufs.dst_ptrs[:total_blocks]
-            sizes = bufs.sizes[:total_blocks]
-            sizes[:] = block_size
-
-            op_idx = 0
-            for block_ids in load_items.values():
-                for block_idx in block_ids:
-                    src_ptrs[op_idx] = src_base + block_idx * block_size
-                    dst_ptrs[op_idx] = dst_buf_base + op_idx * block_size
-                    op_idx += 1
-
-            swap_blocks_batch(src_ptrs, dst_ptrs, sizes, is_src_access_order_any=True)
-
-            self._buf_pool.release(bufs)
+            dst_buf.copy_(src_buf, non_blocking=True)
 
             # Slice contiguous buffer into per-hash views.
             offset = 0

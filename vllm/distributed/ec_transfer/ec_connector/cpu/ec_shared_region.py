@@ -104,6 +104,10 @@ class ECSharedRegion:
         self._blocks_ptr: int = self.blocks.data_ptr()
         self._blocks_nbytes: int = self.blocks.nbytes
 
+    @property
+    def is_pinned(self) -> bool:
+        return self._is_pinned
+
     def pin_memory(self) -> None:
         """Register the entire mmap as CUDA pinned memory for fast DMA.
 
